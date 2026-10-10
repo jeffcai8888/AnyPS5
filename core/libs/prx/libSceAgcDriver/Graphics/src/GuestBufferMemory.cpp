@@ -3339,6 +3339,16 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
         std::snprintf(text, sizeof(text), "guest buffer view 0x%llx+0x%llx %s its GPU owner 0x%llx-0x%llx (buffer %d, direct %d, mirror %d)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), what, static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), region.buffer != nullptr, region.direct != nullptr, region.mirror != nullptr);
         return std::string(text);
     };
+    // Titles size V#s by allocation buckets while a direct import ends at the real allocation;
+    // out-of-bounds reads answer zeros on the hardware, so the view is clamped to its owner.
+    const auto ownerEnd = region.direct != nullptr ? region.direct->base + region.direct->bytes : region.end;
+    if (address >= region.begin && address < ownerEnd && address + bytes > ownerEnd) {
+        static std::mutex clampMutex;
+        static std::set<std::pair<std::uint64_t, std::uint64_t>> clamped;
+        std::lock_guard lock(clampMutex);
+        if (clamped.insert({address, bytes}).second) std::fprintf(stderr, "[gpu] buffer view 0x%llx + 0x%zx clamped to its GPU owner 0x%llx..0x%llx\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(ownerEnd));
+        bytes = static_cast<std::size_t>(ownerEnd - address);
+    }
     if (!(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr))) Require(false, describe("exceeds"));
     const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
     const auto offset = address - base;

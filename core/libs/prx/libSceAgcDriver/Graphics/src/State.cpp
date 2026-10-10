@@ -1,3 +1,4 @@
+#include <mutex>
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"

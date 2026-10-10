@@ -21,6 +21,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
+#include "ControlFlow/include/ControlFlow/RequestSerializer.hpp"
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrProgram.hpp"
@@ -1120,7 +1121,21 @@ auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltyp
         return impl();
     } catch (const std::exception& e) {
         constexpr auto requestSerializer = RequestSerializer{};
-        const auto inputInfo = "\nRecompileRequest:\n" + requestSerializer.Serialize(request);
+        const auto serialized = requestSerializer.Serialize(request);
+        if (std::getenv("APS5_DUMP_SHADERS") != nullptr) {
+            static std::mutex dumpMutex;
+            static std::map<std::uint64_t, std::uint32_t> dumpCount;
+            char name[80];
+            std::lock_guard lock(dumpMutex);
+            const auto index = ++dumpCount[request.shader.codeAddress];
+            std::snprintf(name, sizeof(name), "shader_fail_%llx_%u.req", static_cast<unsigned long long>(request.shader.codeAddress), index);
+            if (std::FILE* file = std::fopen(name, "wb")) {
+                std::fwrite(serialized.data(), 1, serialized.size(), file);
+                std::fclose(file);
+                std::fprintf(stderr, "[recompile] failed request dumped to %s (%s)\n", name, e.what());
+            }
+        }
+        const auto inputInfo = "\nRecompileRequest:\n" + serialized;
         throw std::runtime_error(std::string("ShaderRecompiler::Recompile: ") + e.what() + inputInfo);
     } catch (...) {
         throw std::runtime_error("ShaderRecompiler::Recompile: unknown exception");

@@ -156,7 +156,8 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     }
     for (std::uint32_t i = 0; i < imageGroups.size(); i++) {
         if (!imageGroups[i].empty()) {
-            if (imageGroups[i].size() > RuntimeAbi::HeapCapacity(static_cast<DescriptorBindingKind>(FirstImageBinding + i))) fail("shader image heap capacity exceeded");
+            const auto capacity = RuntimeAbi::HeapCapacity(static_cast<DescriptorBindingKind>(FirstImageBinding + i));
+            if (imageGroups[i].size() > capacity) fail("shader image heap capacity exceeded: binding " + std::to_string(FirstImageBinding + i) + " holds " + std::to_string(imageGroups[i].size()) + " of " + std::to_string(capacity) + " (images " + std::to_string(info.images.size()) + ")");
             addBinding(next, static_cast<DescriptorBindingKind>(FirstImageBinding + i), std::move(imageGroups[i]));
         }
     }

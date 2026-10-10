@@ -169,7 +169,14 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
     std::uint32_t word = 0;
     if (_runtime.readMemory != nullptr) {
         if (!_runtime.readMemory(_runtime.userContext, address, &word)) {
-            return false;
+            // The hardware answers scalar loads through null or unmapped addresses with zero; the
+            // shader's own comparisons and fallback paths (an optional pointer with a direct buffer
+            // read) then specialize on that. Descriptor-bounded reads keep failing instead so the
+            // dynamic path covers an unreadable buffer.
+            if (inst.Opcode() != IrOpcode::LoadAddressU32) {
+                return false;
+            }
+            word = 0;
         }
     } else {
         std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));

@@ -1132,9 +1132,9 @@ constexpr Vop1SdwaRule vop1SdwaRules[] = {
     {RdnaOpcode::VBfrevB32, sdwaSelAll(), 0, 0, false},
     {RdnaOpcode::VCvtF32F16, sdwaSelWords() | sdwaSelFull(), 0, 0, true},
     {RdnaOpcode::VCvtF16F32, sdwaSelAll(), sdwaSelWords(), sdwaSelAll(), true},
-    {RdnaOpcode::VCvtF16U16, sdwaSelAll(), sdwaSelWords(), sdwaSelAll(), false},
+    {RdnaOpcode::VCvtF16U16, sdwaSelBytes() | sdwaSelWords() | sdwaSelFull(), sdwaSelWords(), sdwaSelBytes() | sdwaSelWords() | sdwaSelFull(), false},
     {RdnaOpcode::VCvtU16F16, sdwaSelWords() | sdwaSelFull(), sdwaSelWords(), sdwaSelWords() | sdwaSelFull(), true},
-    {RdnaOpcode::VCvtF16I16, sdwaSelAll(), sdwaSelWords(), sdwaSelAll(), false},
+    {RdnaOpcode::VCvtF16I16, sdwaSelBytes() | sdwaSelWords() | sdwaSelFull(), sdwaSelWords(), sdwaSelBytes() | sdwaSelWords() | sdwaSelFull(), false},
     {RdnaOpcode::VCvtI16F16, sdwaSelWords() | sdwaSelFull(), sdwaSelWords(), sdwaSelWords() | sdwaSelFull(), true},
     {RdnaOpcode::VRcpF16, sdwaSelWords() | sdwaSelFull(), sdwaSelWords(), sdwaSelWords() | sdwaSelFull(), true},
     {RdnaOpcode::VSqrtF16, sdwaSelWords() | sdwaSelFull(), sdwaSelWords(), sdwaSelWords() | sdwaSelFull(), true},
@@ -2242,7 +2242,7 @@ RdnaInstruction DecodeRdnaVop2(std::uint32_t programCounter, std::span<const std
     instruction.programCounter = programCounter;
     instruction.family = RdnaInstructionFamily::VOP2;
     instruction.opcodeId = opcode;
-    instruction.op = lookupVectorOpcode(vop2Opcodes, opcode, "VOP2 opcode is not implemented");
+    instruction.op = lookupVectorOpcode(vop2Opcodes, opcode, ("VOP2 opcode is not implemented at pc " + std::to_string(programCounter)).c_str());
     SetRdnaRawWords(instruction, code, wordIndex, 1);
 
     if (src0 == 249u) {
