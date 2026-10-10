@@ -1,5 +1,6 @@
 // agc_shader_replay <shader_*.req>...: replays compute recompile requests the driver saved with
 // APS5_DUMP_SHADERS=1, running the same resource analysis and recompile steps without the game.
+#include "ControlFlow/ExternalCallFuser.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "ControlFlow/Structurizer.hpp"
@@ -45,6 +46,7 @@ bool g_prepare = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
+bool g_fuse = false;
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -60,6 +62,25 @@ bool Replay(const char* path) {
         if (graphics.mesh.has_value()) {
             const auto& mesh = *graphics.mesh;
             std::printf("  mesh: input primitive %u, %u primitives / %u vertices per group, max %u vertices / %u primitives, %u threads, lds %u dwords, provoking %u, ESGS item %u\n", mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize);
+        }
+    }
+    std::vector<std::uint32_t> fusedCode;
+    if (g_fuse) {
+        // --fuse: replace external scalar calls (targets addressed through user data) with synthetic
+        // straight-line callees and run the fused program through the rest of the pipeline. The
+        // callees are semantically wrong for actual execution; this validates the compiler side.
+        const auto& context = request.request.context;
+        const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(request.request.shader.code);
+        const auto sites = ShaderRecompiler::AnalyzeExternalSwappcCalls(decoded, context.userDataBaseRegister, static_cast<std::uint32_t>(context.userData.size()));
+        if (!sites.empty()) {
+            std::vector<ShaderRecompiler::ExternalCallee> callees;
+            for (const auto& site : sites) {
+                const std::array<std::uint32_t, 2> body{0x7e000200u, 0xbe800000u | (0x20u << 8u) | site.targetRegister};
+                callees.push_back(ShaderRecompiler::DecodeExternalCallee(body, site.targetRegister));
+            }
+            fusedCode = ShaderRecompiler::FuseExternalCalls(decoded, request.request.shader.code, sites, callees);
+            std::printf("  fused %zu external scalar calls into %zu code words\n", sites.size(), fusedCode.size());
+            request.request.shader.code = fusedCode;
         }
     }
     if (g_memory) {
@@ -163,7 +184,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--code] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--code] [--maintenance8] [--fuse] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
@@ -194,6 +215,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--prepare") {
             g_prepare = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--fuse") {
+            g_fuse = true;
             continue;
         }
         if (std::string(argv[i]) == "--spv") {

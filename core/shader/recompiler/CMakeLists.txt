@@ -48,6 +48,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RdnaDecoder/src/RdnaExportOpDecoder.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RdnaDecoder/src/RdnaDescriptorFormat.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/ControlFlowGraph.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/ExternalCallFuser.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/GraphBuilder.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/Structurizer.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/RequestSerializer.cpp
@@ -216,12 +217,15 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            AnalyzeExternalSwappcCalls
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources
             DebugProbeActive
+            DecodeExternalCallee
             DepthBitsTextureWidth
+            FuseExternalCalls
             HashBytes
             PixelInput
             PixelInputBit
