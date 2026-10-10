@@ -1,3 +1,16 @@
+#include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+namespace {
+void TraceAgcCall(const char* fn, const void* a, const void* b) {
+    static const bool trace = std::getenv("APS5_TRACE_AGC") != nullptr;
+    if (trace) std::fprintf(stderr, "[agc] t%lu %s a=%p b=%p\n", GetCurrentThreadId(), fn, a, b);
+}
+}
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -61,6 +74,7 @@ GsOccupancyLimits getGsOccupancyLimits(const Shader* gs, std::uint32_t vertexCap
 extern "C" {
 
 int APS5_VABI sceAgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs, std::uint32_t budget, float factor) {
+    TraceAgcCall(__func__, nullptr, nullptr);
     if (regs == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": regs is null");
     }

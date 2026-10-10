@@ -1,8 +1,12 @@
 #include "prx/libSceAgc/Shader/include/CreateShader.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <prx/libc/include/General.hpp>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "SceShaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -17,6 +21,14 @@ extern "C" {
 
 int APS5_VABI sceAgcCreateShader(Shader** dst, void* header, const volatile void* code) {
     constexpr auto fn = __func__;
+    {
+        static const bool trace = std::getenv("APS5_TRACE_AGC") != nullptr;
+        if (trace) {
+            const auto* h = static_cast<const Shader*>(header);
+            std::fprintf(stderr, "[agc] t%lu CreateShader type=%u header=%p code=%p size=%u\n",
+                GetCurrentThreadId(), h ? h->type : 255, header, const_cast<const void*>(code), h ? h->shader_size : 0);
+        }
+    }
     if (dst == nullptr) {
         throw std::runtime_error(std::string(fn) + ": dst is null");
     }

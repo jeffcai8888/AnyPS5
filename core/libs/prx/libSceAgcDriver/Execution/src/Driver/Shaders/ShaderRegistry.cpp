@@ -1,5 +1,7 @@
 #include "prx/libc/include/general/LogMacros.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
+#include "ControlFlow/ExternalCallFuser.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
 #include "ControlFlow/Structurizer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -11,9 +13,12 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
@@ -159,6 +164,9 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
                 transaction.Commit();
                 return;
             }
+            std::fprintf(stderr, "[gpu] code 0x%llx re-registered: header 0x%llx type %u -> header 0x%llx type %u\n",
+                static_cast<unsigned long long>(snapshot->codeAddress), static_cast<unsigned long long>(current.headerAddress), current.type,
+                static_cast<unsigned long long>(snapshot->headerAddress), snapshot->type);
         }
     }
     auto next = registry != nullptr ? std::make_shared<ShaderRegistry>(*registry) : std::make_shared<ShaderRegistry>();
@@ -202,25 +210,93 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
     throw std::runtime_error("AGC driver: prepared rectangle artifacts are missing");
 }
 
+// Reads up to `limit` bytes of guest shader code at `address`, shrinking the window until it fits
+// mapped memory. Program addresses sometimes travel shifted by 8 (the SPI register encoding), so
+// both forms are probed. Returns nothing when neither is readable.
+std::optional<std::vector<std::uint32_t>> ReadGuestCodeWindow(std::uint64_t address, std::size_t limit) {
+    for (const std::uint64_t candidate : {address, address << 8u}) {
+        if ((candidate & 3u) != 0u) continue;
+        for (std::size_t bytes = limit; bytes >= 256u; bytes /= 2u) {
+            std::vector<std::byte> buffer(bytes);
+            if (GuestMemory::CopyMapped(candidate, buffer) != GuestMemory::Compare::Equal) continue;
+            GuestMemory::FlushGpuWrites(candidate, bytes);
+            if (GuestMemory::CopyMapped(candidate, buffer) != GuestMemory::Compare::Equal) break;
+            std::vector<std::uint32_t> words(bytes / 4u);
+            std::memcpy(words.data(), buffer.data(), bytes);
+            return words;
+        }
+    }
+    return std::nullopt;
+}
+
+// Fuses the external scalar calls of a registered compute shader for one dispatch: every call site
+// whose target address arrives in user data becomes a static branch into a private copy of the
+// callee code, and the callee return branches back. Returns false when the shader has no such
+// calls; throws when it does but the callees cannot be resolved.
+bool FuseExternalCallsForDispatch(const ShaderSnapshot& snapshot, const ShaderRecompiler::RecompileRequest& request, std::vector<std::uint32_t>& fused) {
+    if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) return false;
+    ShaderRecompiler::RdnaProgram decoded;
+    std::vector<ShaderRecompiler::ExternalCallSite> sites;
+    try {
+        decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(request.shader.code);
+        sites = ShaderRecompiler::AnalyzeExternalSwappcCalls(decoded, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()));
+    } catch (const std::exception&) {
+        // The compile below reports decode failures with its request dump attached.
+        return false;
+    }
+    if (sites.empty()) return false;
+    std::vector<ShaderRecompiler::ExternalCallee> callees;
+    callees.reserve(sites.size());
+    for (const auto& site : sites) {
+        const auto& userData = request.context.userData;
+        if (site.targetUserDataBase + 1u >= userData.size()) {
+            throw std::runtime_error("AGC driver: external scalar call reads its target outside the dispatched user data");
+        }
+        const auto target = static_cast<std::uint64_t>(userData[site.targetUserDataBase]) | (static_cast<std::uint64_t>(userData[site.targetUserDataBase + 1u]) << 32u);
+        auto window = ReadGuestCodeWindow(target, 16u * 1024u);
+        if (!window.has_value()) {
+            char text[96];
+            std::snprintf(text, sizeof(text), "AGC driver: external scalar call target 0x%llx has no readable guest code", static_cast<unsigned long long>(target));
+            throw std::runtime_error(text);
+        }
+        callees.push_back(ShaderRecompiler::DecodeExternalCallee(*window, site.targetRegister));
+    }
+    fused = ShaderRecompiler::FuseExternalCalls(decoded, request.shader.code, sites, callees);
+    static std::mutex reportedMutex;
+    static std::set<std::pair<std::uint64_t, std::size_t>> reported;
+    std::lock_guard lock(reportedMutex);
+    if (reported.insert({request.shader.codeAddress, fused.size()}).second) {
+        std::fprintf(stderr, "[gpu] fused %zu external scalar calls of compute shader 0x%llx into %zu code words\n", sites.size(), static_cast<unsigned long long>(request.shader.codeAddress), fused.size());
+    }
+    return true;
+}
+
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
-    require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
     auto invocationRequest = request;
+    std::vector<std::uint32_t> fusedCode;
+    const bool fused = FuseExternalCallsForDispatch(snapshot, request, fusedCode);
+    if (fused) {
+        invocationRequest.shader.code = fusedCode;
+    } else {
+        require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
+    }
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
     std::lock_guard lock(snapshot.prepared->mutex);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
-        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
+        const auto& entryCode = ShaderRecompiler::GetPreparedCode(*entry.handle);
+        if (fused && (entryCode.size() != fusedCode.size() || !std::ranges::equal(entryCode, fusedCode))) continue;
+        invocationRequest.shader.code = entryCode;
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
     }
-    if (snapshot.header.empty()) {
-        if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
-        APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
-        auto handle = ShaderRecompiler::PrepareShader(request);
-        invocationRequest = request;
+    if (fused || snapshot.header.empty()) {
+        if (!fused && (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute)) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
+        APS5_LOG_ERR("Compute shader 0x%llx has no prepared artifact; preparing it at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+        auto handle = ShaderRecompiler::PrepareShader(invocationRequest);
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
         if (!invocation.has_value()) throw std::runtime_error("AGC driver: raw compute artifact does not match its invocation");
@@ -314,7 +390,8 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     std::uint32_t resourceRegister;
     std::uint32_t firstUser = 0;
     Stage stage;
-    switch (snapshot.type) {
+    try {
+        switch (snapshot.type) {
     case 0: stage = Stage::Compute; programRegister = 0x20c; resourceRegister = 0x213; break;
     case 1: stage = Stage::Fragment; programRegister = 0x008; resourceRegister = 0x00b; break;
     case 2: stage = Stage::Vertex; programRegister = 0x0c8; resourceRegister = 0x08b; firstUser = 8; break;
@@ -322,7 +399,34 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     case 5: stage = Stage::Local; programRegister = 0x148; resourceRegister = 0x10b; firstUser = 8; break;
     case 6: stage = Stage::Mesh; programRegister = 0x088; resourceRegister = 0x08b; break;
     case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
-    default: throw std::runtime_error("AGC driver: unsupported registered shader type");
+    default: {
+        // Unknown shader types cannot be prepared, but failing registration outright also takes
+        // down every later stage; leave the artifact to fail loudly if the shader is ever used.
+        static std::mutex unknownMutex;
+        static std::set<std::pair<std::uint8_t, std::uint64_t>> unknown;
+        std::lock_guard lock(unknownMutex);
+        if (unknown.insert({snapshot.type, snapshot.codeAddress}).second) {
+            char words[96] = "";
+            for (std::size_t i = 0; i < snapshot.code.size() && i < 8u; ++i) {
+                char word[12];
+                std::snprintf(word, sizeof(word), "%s%08x", i != 0u ? " " : "", snapshot.code[i]);
+                std::strncat(words, word, sizeof(words) - std::strlen(words) - 1);
+            }
+            std::fprintf(stderr, "[gpu] registered shader 0x%llx has unsupported type %u; leaving it unprepared (first words: %s)\n", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.type, words);
+        }
+        return {};
+    }
+    }
+    if ((snapshot.type == 4u || snapshot.type == 5u) && registration && !state.shader.contains(programRegister + 1u)) {
+        // Geometry and hull front halves carry no program address pair of their own (the queue
+        // binds them at draw time); their artifacts are prepared through the graphics ABI.
+        static std::mutex frontMutex;
+        static std::set<std::uint64_t> fronts;
+        std::lock_guard lock(frontMutex);
+        if (fronts.insert(snapshot.codeAddress).second) {
+            std::fprintf(stderr, "[gpu] front half shader 0x%llx type %u has no program address pair; deferring its artifact to the graphics ABI\n", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.type);
+        }
+        return {};
     }
     const auto high = RegisterValue(state.shader, programRegister + 1);
     if ((high & ~0xffu) != 0) throw std::runtime_error("AGC driver: invalid registered program address");
@@ -366,7 +470,39 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     std::vector<std::uint32_t> userData(userCount);
     if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, userData, nullptr, true);
     const ShaderRecompiler::SwappcInfo swappc{vertex.has_value(), firstUser, userCount};
-    auto graph = ShaderRecompiler::GraphBuilder{}.Build(decoded, &swappc);
+    // Shaders that call code addressed through user data can only be compiled per dispatch, when
+    // the targets are known. Registration defers them; InvocationFor fuses the callees in.
+    if (stage == Stage::Compute && !ShaderRecompiler::AnalyzeExternalSwappcCalls(decoded, firstUser, userCount).empty()) {
+        static std::mutex deferredMutex;
+        static std::set<std::uint64_t> deferred;
+        std::lock_guard lock(deferredMutex);
+        if (deferred.insert(address).second) {
+            std::fprintf(stderr, "[gpu] compute shader 0x%llx calls code addressed through user data; deferring its artifact to dispatch\n", static_cast<unsigned long long>(address));
+        }
+        return {};
+    }
+    auto graph = [&] {
+        try {
+            return ShaderRecompiler::GraphBuilder{}.Build(decoded, &swappc);
+        } catch (const std::exception& error) {
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "shader_fail_%llx_pre.req", static_cast<unsigned long long>(address));
+                try {
+                    const std::vector<ShaderRecompiler::MemoryRegion> noMemory;
+                    const ShaderRecompiler::RecompileRequest failed{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, userData, compute, pixel, vertex, noMemory, RegisteredFloatMode(snapshot)}, stage == Stage::Compute ? device.ComputeTarget(wave) : device.Target(), {0, 0, 0, 128}, graphics};
+                    const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(failed);
+                    if (std::FILE* file = std::fopen(name, "wb")) {
+                        std::fwrite(text.data(), 1, text.size(), file);
+                        std::fclose(file);
+                    }
+                } catch (...) {
+                }
+                std::fprintf(stderr, "[gpu] registered shader 0x%llx failed control flow analysis (%s), request dumped to %s\n", static_cast<unsigned long long>(address), error.what(), name);
+            }
+            throw;
+        }
+    }();
     ShaderRecompiler::Structurizer{}.Structurize(graph);
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
     ShaderRecompiler::RecompileRequest request{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, userData, compute, pixel, vertex, memory, RegisteredFloatMode(snapshot)}, stage == Stage::Compute ? device.ComputeTarget(wave) : device.Target(), {0, 0, 0, 128}, graphics};
@@ -385,6 +521,11 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
         append();
     }
     return entries;
+    } catch (const std::exception& error) {
+        char context[96];
+        std::snprintf(context, sizeof(context), " (preparing registered shader 0x%llx type %u)", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.type);
+        throw std::runtime_error(error.what() + std::string(context));
+    }
 }
 
 }
@@ -462,7 +603,15 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             require(registry != nullptr && registry->contains(address), "graphics ABI refers to an unregistered shader");
             if (owner == nullptr) owner = registry->at(address);
             const auto& snapshot = *registry->at(address);
-            require(snapshot.headerAddress == reinterpret_cast<std::uintptr_t>(shader), "graphics ABI refers to a replaced shader header");
+            // PSO precache passes patched header copies; the code identity selects the artifact.
+            if (snapshot.headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
+                static std::mutex mismatchMutex;
+                static std::set<std::uint64_t> mismatched;
+                std::lock_guard lock(mismatchMutex);
+                if (mismatched.insert(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(shader->code))).second) {
+                    std::fprintf(stderr, "[gpu] graphics ABI header is a copy; resolving by code identity\n");
+                }
+            }
             require(snapshot.registeredState != nullptr, "registered shader state is missing");
             const auto& registered = *snapshot.registeredState;
             for (const auto& [offset, value] : registered.shader) state.shader.insert_or_assign(offset, value);
@@ -527,7 +676,15 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
         require(shaders != nullptr && shaders->contains(address), "static ABI refers to an unregistered shader");
         snapshot = shaders->at(address);
-        require(snapshot->headerAddress == reinterpret_cast<std::uintptr_t>(shader), "static ABI refers to a replaced shader header");
+        // PSO precache passes patched header copies; the code identity selects the artifact.
+        if (snapshot->headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
+            static std::mutex mismatchMutex;
+            static std::set<std::uint64_t> mismatched;
+            std::lock_guard lock(mismatchMutex);
+            if (mismatched.insert(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(shader->code))).second) {
+                std::fprintf(stderr, "[gpu] static ABI header is a copy; resolving by code identity\n");
+            }
+        }
     }
     require(snapshot->registeredState != nullptr, "registered shader state is missing");
     QueueState state{};
@@ -589,7 +746,16 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
             const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
             require(shaders != nullptr && shaders->contains(address), "rectangle ABI refers to an unregistered shader");
             const auto snapshot = shaders->at(address);
-            require(snapshot->headerAddress == reinterpret_cast<std::uintptr_t>(shader), "rectangle ABI refers to a replaced shader header");
+            // Title runtimes pass stack or heap COPIES of a registered header with patched fields
+            // (PSO precache interpolant mapping); the code identity selects the artifact.
+            if (snapshot->headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
+                static std::mutex mismatchMutex;
+                static std::set<std::uint64_t> mismatched;
+                std::lock_guard lock(mismatchMutex);
+                if (mismatched.insert(address).second) {
+                    std::fprintf(stderr, "[gpu] rectangle ABI header 0x%llx is a copy of registered shader 0x%llx; resolving by code identity\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)), static_cast<unsigned long long>(address));
+                }
+            }
             return snapshot;
         };
         front = lookup(vertex);
@@ -667,6 +833,12 @@ void Driver::RegisterShader(const Shader* shader) {
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
     std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    // Experiment switch: drop type-8 (Fs) registrations entirely to test crash correlation.
+    if (fields.type == 8u && std::getenv("APS5_SKIP_FS") != nullptr) {
+        static std::once_flag once;
+        std::call_once(once, [] { std::fprintf(stderr, "[gpu] APS5_SKIP_FS: type-8 registration dropped\n"); });
+        return;
+    }
     require(fields.file_header == 0x34333231u && fields.version == 0x18u, "invalid shader header");
     require(fields.header_size >= sizeof(Shader), "shader header is smaller than its fixed fields");
     require(fields.shader_size != 0 && (fields.shader_size & 3u) == 0, "invalid shader size");
