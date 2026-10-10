@@ -1,9 +1,12 @@
+#include <mutex>
+#include <set>
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <exception>
 
 namespace AgcDriver::Graphics {
@@ -39,6 +42,7 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
+    if (size >= 16u * 1024 * 1024) std::fprintf(stderr, "[gpu] host buffer alloc %zu bytes usage 0x%x props 0x%x\n", size, usage, properties);
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
@@ -151,8 +155,9 @@ void Buffer::Invalidate() {
     Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
-DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage) {
+DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(usage) {
     Require(size != 0, "zero-sized device buffer");
+    if (size >= 16u * 1024 * 1024) std::fprintf(stderr, "[gpu] device buffer alloc %zu bytes usage 0x%x\n", size, usage);
     cache = GetBufferPool(context);
     if (const auto allocation = cache->Take(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
         buffer = allocation->buffer;
@@ -182,7 +187,25 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = ClassAllocationBytes(requirements, capacity);
         allocationBytes = allocation.allocationSize;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+        try {
+            memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+        } catch (const std::runtime_error&) {
+            if (capacity < 4ull * 1024 * 1024) throw;
+            // A staging request video memory cannot serve (8 GiB cards) falls back to cached host
+            // memory: the GPU streams the buffer over PCIe instead of failing.
+            static std::mutex fallbackMutex;
+            static std::set<std::size_t> reported;
+            {
+                std::lock_guard fallbackLock(fallbackMutex);
+                if (reported.insert(capacity).second) std::fprintf(stderr, "[gpu] device buffer of %zu bytes fell back to host memory\n", capacity);
+            }
+            try {
+                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            } catch (const std::runtime_error&) {
+                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            }
+            memory = cache->AllocateMemory(allocation, "vkAllocateMemory host fallback buffer");
+        }
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
