@@ -762,8 +762,9 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const bool volume = ((attrib3 >> 24u) & 3u) == 2u;
     if (volume) {
         color.depth = (attrib3 & 0x1fffu) + 1u;
-        Require(maxMip == 0 && (info & 0x10000000u) == 0, "mipmapped or DCC 3D color targets are unsupported");
-        Require(slice < color.depth, "the color view slice is beyond the 3D surface");
+        // The attachment view expresses a base-mip slice of a 3D surface; the surface carrying
+        // more mip levels (or tolerating DCC like the 2D path) does not change that view.
+        Require(viewMip == 0 && slice < color.depth, "3D color target views beyond the base mip are unsupported");
         color.depthSlice = slice;
     }
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};

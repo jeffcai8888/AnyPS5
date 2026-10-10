@@ -199,15 +199,24 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     throw std::runtime_error("AGC driver: prepared shader artifact is missing for the requested static ABI: address=" + std::to_string(request.shader.codeAddress) + " stage=" + std::to_string(static_cast<std::uint32_t>(request.shader.stage)) + " wave=" + std::to_string(request.context.waveSize) + " pushOffset=" + std::to_string(request.layout.pushConstantOffsetBytes) + " pushCapacity=" + std::to_string(request.layout.pushConstantSizeBytes) + " preparedLayouts=" + layouts);
 }
 
-ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId) {
+ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, const ShaderRecompiler::CompiledShaderArtifact& vertex, const ShaderRecompiler::CompiledShaderArtifact& fragment, const ShaderRecompiler::SpirvTarget& target) {
     std::lock_guard lock(snapshot.prepared->mutex);
     for (const auto& entry : snapshot.prepared->rectangles) {
-        if (entry.vertexId == vertexId && entry.fragmentId == fragmentId) {
+        if (entry.vertexId == vertex.variantId && entry.fragmentId == fragment.variantId) {
             require(entry.shaders != nullptr, "prepared rectangle artifact is missing");
             return *entry.shaders;
         }
     }
-    throw std::runtime_error("AGC driver: prepared rectangle artifacts are missing");
+    // A draw can pair artifacts the resolve-time rectangle build never saw (a variant prepared
+    // later, or a resolve deduplicated by its ABI key); build the pair here.
+    ShaderRecompiler::RecompileResult vertexResult;
+    ShaderRecompiler::RecompileResult fragmentResult;
+    static_cast<ShaderRecompiler::CompiledShaderArtifact&>(vertexResult) = vertex;
+    static_cast<ShaderRecompiler::CompiledShaderArtifact&>(fragmentResult) = fragment;
+    auto built = std::make_shared<const ShaderRecompiler::RectListShaders>(ShaderRecompiler::BuildRectListShaders(vertexResult, fragmentResult, target));
+    const auto result = *built;
+    snapshot.prepared->rectangles.push_back({vertex.variantId, fragment.variantId, std::move(built)});
+    return result;
 }
 
 // Reads up to `limit` bytes of guest shader code at `address`, shrinking the window until it fits
@@ -293,13 +302,16 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         invocationRequest.shader.code = entryCode;
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
     }
-    if (fused || snapshot.header.empty()) {
-        if (!fused && (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute)) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
-        APS5_LOG_ERR("Compute shader 0x%llx has no prepared artifact; preparing it at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+    {
+        if (!fused && snapshot.header.empty() && (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute)) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
+        // A registered shader can be dispatched through an ABI combination its registration did not
+        // anticipate (the presenter executing a registered conversion program's other entry point);
+        // prepare that variant here instead of failing the dispatch.
+        APS5_LOG_ERR("Shader 0x%llx has no prepared artifact for this invocation; preparing it at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
         auto handle = ShaderRecompiler::PrepareShader(invocationRequest);
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
-        if (!invocation.has_value()) throw std::runtime_error("AGC driver: raw compute artifact does not match its invocation");
+        if (!invocation.has_value()) throw std::runtime_error("AGC driver: prepared artifact does not match its invocation");
         snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
         return std::move(*invocation);
     }
@@ -764,6 +776,40 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
     require(front != fragment, "rectangle stages refer to the same shader");
     const auto localDevice = device.Load();
     require(localDevice != nullptr, "shader registration device is missing");
+    const auto ensureEntries = [&](const std::shared_ptr<const ShaderSnapshot>& snapshot) {
+        if (snapshot == nullptr || !transaction.Read(*snapshot).entries.empty()) return;
+        require(snapshot->registeredState != nullptr, "rectangle ABI shader state is missing");
+        std::uint32_t programRegister;
+        switch (snapshot->type) {
+        case 0: programRegister = 0x20c; break;
+        case 1: programRegister = 0x008; break;
+        case 2: case 4: programRegister = 0x0c8; break;
+        case 5: programRegister = 0x148; break;
+        case 6: programRegister = 0x088; break;
+        case 7: programRegister = 0x108; break;
+        default: throw std::runtime_error("AGC driver: rectangle ABI shader type cannot be prepared");
+        }
+        // The rectangle lookup already resolved the entry point by code identity; a shader whose
+        // registration deferred (front halves carry no address pair) gets it injected here.
+        QueueState state{};
+        state.shader = snapshot->registeredState->shader;
+        state.context = snapshot->registeredState->context;
+        state.userConfig = snapshot->registeredState->userConfig;
+        state.shader.insert_or_assign(programRegister, static_cast<std::uint32_t>(snapshot->codeAddress >> 8u));
+        state.shader.insert_or_assign(programRegister + 1u, static_cast<std::uint32_t>((snapshot->codeAddress >> 40u) & 0xffu));
+        // The rectangle ABI carries the primitive type the registration-time state never saw.
+        state.userConfig.insert_or_assign(0x242u, primitiveType);
+        // A rectangle draw is the plain vertex path; the registered routing (captured for the
+        // shader's geometry or tessellation use) must not steer the rectangle prepare there.
+        if (const auto routing = state.context.find(0x2d5u); routing != state.context.end()) {
+            state.context.insert_or_assign(0x2d5u, routing->second & ~(0x20u | 0x4u));
+        }
+        auto entries = PrepareRegistered(*snapshot, *localDevice, state, false);
+        auto& prepared = transaction.Edit(*snapshot);
+        for (auto& entry : entries) prepared.entries.push_back(std::move(entry));
+    };
+    ensureEntries(front);
+    ensureEntries(fragment);
     ResolvePreparedGraphics(*front, fragment, primitiveType, localDevice->Target());
     transaction.Commit();
 }
@@ -796,7 +842,12 @@ void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<
     for (const auto& pixel : fragments) {
         const auto& current = transaction.Read(front);
         const auto& pixelPrepared = transaction.Read(*pixel);
-        require(!current.entries.empty() && !pixelPrepared.entries.empty(), "rectangle ABI has missing stage artifacts");
+        if (current.entries.empty() || pixelPrepared.entries.empty()) {
+            char detail[192];
+            std::snprintf(detail, sizeof(detail), "rectangle ABI has missing stage artifacts: front type %u entries %zu, fragment type %u entries %zu",
+                front.type, current.entries.size(), pixel->type, pixelPrepared.entries.size());
+            require(false, detail);
+        }
         const auto progress = std::ranges::find_if(current.rectangleProgress, [&](const auto& entry) { return entry.fragment.lock() == pixel; });
         const auto vertexCount = progress == current.rectangleProgress.end() ? 0u : progress->vertexCount;
         const auto fragmentCount = progress == current.rectangleProgress.end() ? 0u : progress->fragmentCount;

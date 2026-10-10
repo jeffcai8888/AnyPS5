@@ -76,7 +76,7 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
 
 void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint32_t primitiveType, const ShaderRecompiler::SpirvTarget& target);
 
-ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId);
+ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, const ShaderRecompiler::CompiledShaderArtifact& vertex, const ShaderRecompiler::CompiledShaderArtifact& fragment, const ShaderRecompiler::SpirvTarget& target);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
