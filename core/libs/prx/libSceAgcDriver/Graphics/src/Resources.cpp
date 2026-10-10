@@ -1,14 +1,18 @@
+#include <mutex>
+#include <set>
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <cstdio>
 #include <exception>
 
 namespace AgcDriver::Graphics {
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage), properties(properties) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(usage), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
+    if (size >= 16u * 1024 * 1024) std::fprintf(stderr, "[gpu] host buffer alloc %zu bytes usage 0x%x props 0x%x\n", size, usage, properties);
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
@@ -88,8 +92,9 @@ void Buffer::Invalidate() {
     Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
-DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage) {
+DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(usage) {
     Require(size != 0, "zero-sized device buffer");
+    if (size >= 16u * 1024 * 1024) std::fprintf(stderr, "[gpu] device buffer alloc %zu bytes usage 0x%x\n", size, usage);
     cache = GetBufferPool(context);
     if (const auto allocation = cache->Take(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
         buffer = allocation->buffer;
@@ -109,7 +114,25 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        const VkResult allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+        VkResult allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+        if (allocated != VK_SUCCESS && capacity >= 4ull * 1024 * 1024) {
+            // A staging request video memory cannot serve (8 GiB cards) falls back to cached
+            // host memory: the GPU streams the buffer over PCIe instead of failing.
+            static std::mutex fallbackMutex;
+            static std::set<std::size_t> reported;
+            bool first = false;
+            {
+                std::lock_guard fallbackLock(fallbackMutex);
+                first = reported.insert(capacity).second;
+            }
+            if (first) std::fprintf(stderr, "[gpu] device buffer of %zu bytes fell back to host memory (Vulkan result %d)\n", capacity, static_cast<int>(allocated));
+            try {
+                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            } catch (const std::runtime_error&) {
+                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            }
+            allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+        }
         if (allocated != VK_SUCCESS) {
             std::fprintf(stderr, "[gpu] device buffer allocation of %zu bytes (capacity %zu) failed with Vulkan result %d\n", size, capacity, static_cast<int>(allocated));
         }
