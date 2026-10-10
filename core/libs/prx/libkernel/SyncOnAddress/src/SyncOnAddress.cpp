@@ -1,3 +1,4 @@
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -51,8 +52,19 @@ struct AddressWaiter {
     bool woken = false;
 };
 
-std::mutex g_waitersLock;
-std::unordered_map<std::uintptr_t, std::list<AddressWaiter*>> g_waiters;
+// Per-bucket shards (from SoS-PS5): title worker threads wait on many distinct addresses at once,
+// and one global lock serializes every wait and wake through a single point.
+constexpr std::size_t ShardCount = 64;
+struct Shard {
+    std::mutex mutex;
+    std::unordered_map<std::uintptr_t, std::list<AddressWaiter*>> waiters;
+};
+std::array<Shard, ShardCount> g_shards;
+
+Shard& ShardOf(const void* address) {
+    const auto hashed = (reinterpret_cast<std::uintptr_t>(address) >> 2) * 0x9e3779b97f4a7c15ull;
+    return g_shards[hashed % ShardCount];
+}
 
 template <class TValue>
 bool IsAlignedAddress(std::uintptr_t address) {
@@ -62,13 +74,14 @@ bool IsAlignedAddress(std::uintptr_t address) {
 template <class TValue>
 bool WaitOnAddressUntil(TValue* address, TValue expected, std::optional<std::uint64_t> deadlineNanos, const void* caller) {
     const auto key = reinterpret_cast<std::uintptr_t>(address);
-    std::unique_lock<std::mutex> lock(g_waitersLock);
+    Shard& shard = ShardOf(address);
+    std::unique_lock<std::mutex> lock(shard.mutex);
     if (std::atomic_ref<TValue>(*address).load() != expected) {
         return true;
     }
 
     AddressWaiter waiter;
-    auto& queue = g_waiters[key];
+    auto& queue = shard.waiters[key];
     const auto position = queue.insert(queue.end(), &waiter);
     const auto isWoken = [&] { return waiter.woken; };
     const auto waitStart = std::chrono::steady_clock::now();
@@ -83,7 +96,7 @@ bool WaitOnAddressUntil(TValue* address, TValue expected, std::optional<std::uin
     if (!woken) {
         queue.erase(position);
         if (queue.empty()) {
-            g_waiters.erase(key);
+            shard.waiters.erase(key);
         }
     }
     lock.unlock();
@@ -98,9 +111,10 @@ int WaitOnAddress(TValue* address, TValue expected, const KernelUseconds* timeou
 }
 
 void WakeAddress(std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
-    std::lock_guard<std::mutex> lock(g_waitersLock);
-    const auto entry = g_waiters.find(key);
-    if (entry == g_waiters.end()) {
+    Shard& shard = ShardOf(reinterpret_cast<const void*>(key));
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto entry = shard.waiters.find(key);
+    if (entry == shard.waiters.end()) {
         return;
     }
     auto& queue = entry->second;
@@ -111,7 +125,7 @@ void WakeAddress(std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
         waiter->condition.NotifyOne();
     }
     if (queue.empty()) {
-        g_waiters.erase(entry);
+        shard.waiters.erase(entry);
     }
 }
 

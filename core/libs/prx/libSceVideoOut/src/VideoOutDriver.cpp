@@ -624,6 +624,24 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 const auto dequeued = AgcDriver::FrameTiming::Clock::now();
                 current->timing->Add(current->timing->Get("VideoOut", "queue"), dequeued - current->queuedAt);
                 processFlip(*current);
+                // Optional frame-rate cap (APS5_FPS_CAP=60 etc., from SoS-PS5): spaces flips so a
+                // title rendering uncapped does not saturate the presenter and starve input polling.
+                {
+                    static const std::chrono::steady_clock::duration capInterval = [] {
+                        const char* text = std::getenv("APS5_FPS_CAP");
+                        const double cap = text ? std::atof(text) : 0.0;
+                        if (cap < 30.0 || cap > 1000.0) return std::chrono::steady_clock::duration::zero();
+                        return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(1.0 / cap));
+                    }();
+                    if (capInterval != std::chrono::steady_clock::duration::zero()) {
+                        static std::chrono::steady_clock::time_point schedule{};
+                        const auto flipStart = std::chrono::steady_clock::now();
+                        if (schedule == std::chrono::steady_clock::time_point{} || flipStart - schedule > capInterval) schedule = flipStart;
+                        const auto due = schedule + capInterval;
+                        schedule = due;
+                        while (std::chrono::steady_clock::now() < due) std::this_thread::yield();
+                    }
+                }
                 const auto finished = AgcDriver::FrameTiming::Clock::now();
                 AgcDriver::FrameTiming::Clock::duration interval{};
                 {
