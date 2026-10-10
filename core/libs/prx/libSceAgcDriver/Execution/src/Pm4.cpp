@@ -38,6 +38,19 @@ void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
 }
 
+void require(bool condition, const std::string& reason) {
+    if (!condition) throw std::runtime_error(reason);
+}
+
+std::string PacketWords(std::span<const std::uint32_t> packet) {
+    std::string text;
+    for (const auto word : packet) {
+        if (!text.empty()) text += ' ';
+        text += ToHex(word);
+    }
+    return text;
+}
+
 std::uint64_t address(std::uint32_t low, std::uint32_t high) {
     return low | (static_cast<std::uint64_t>(high) << 32u);
 }
@@ -442,15 +455,23 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             require(source < 10 || source == CopyDataGpuClockSource || ((packet[1] & 0x10000u) == 0 && packet[3] == 0), "64-bit immediate COPY_DATA is not implemented");
             break;
         }
-        case 0x50:
+        case 0x50: {
             size(7);
             require((packet[1] & ~(0xe0300001u | DmaSourceCachePolicy | DmaDestinationCachePolicy)) == 0, "DMA_DATA reserved fields are not implemented");
-            require(memorySelector(dmaDestination(packet)) || dmaDestination(packet) == DmaSelectGds, "DMA_DATA register or prefetch destination is not implemented");
+            const auto dmaBytes = packet[6] & 0x3ffffffu;
+            const bool dmaCacheOperation = dmaDestination(packet) == 2u && dmaSource(packet) != 2u &&
+                address(packet[2], packet[3]) == address(packet[4], packet[5]);
+            // Selector 2 with matching source and destination (or no bytes) is a counter or cache
+            // range operation the coherent memory model already satisfies.
+            require(memorySelector(dmaDestination(packet)) || dmaDestination(packet) == DmaSelectGds ||
+                (dmaDestination(packet) == 2u && (dmaBytes == 0u || dmaCacheOperation)),
+                "DMA_DATA register or prefetch destination is not implemented: selector " + std::to_string(dmaDestination(packet)) + ", packet " + PacketWords(packet));
             require(memorySelector(dmaSource(packet)) || dmaSource(packet) == 2 || dmaSource(packet) == DmaSelectGds, "DMA_DATA register source is not implemented");
             require(dmaSource(packet) != DmaSelectGds || (packet[3] == 0 && gdsRange(packet[2], packet[6] & 0x3ffffffu)), "DMA_DATA GDS source range exceeds the GDS");
             require(dmaDestination(packet) != DmaSelectGds || (packet[5] == 0 && gdsRange(packet[4], packet[6] & 0x3ffffffu)), "DMA_DATA GDS destination range exceeds the GDS");
             require(dmaSource(packet) != 2 || packet[3] == 0, "DMA_DATA immediate exceeds 32 bits");
             break;
+        }
         default: throw std::runtime_error("known packet has no validator");
     }
 }
@@ -572,6 +593,8 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
         case 0x50: {
             if (packet.size() < 7 || dmaDestination(packet) == DmaSelectGds) return std::nullopt;
             const std::size_t bytes = packet[6] & 0x3ffffffu;
+            if (bytes == 0u) return std::nullopt;
+            if (dmaDestination(packet) == 2u && dmaSource(packet) != 2u && address(packet[2], packet[3]) == address(packet[4], packet[5])) return std::nullopt;
             const auto destination = address(packet[4], packet[5]);
             if (!fits(destination, bytes)) return std::nullopt;
             return StoreWrite{destination, {}, dmaSourceBytes(packet)};
@@ -872,6 +895,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
         case 0x50: {
             const std::size_t bytes = packet[6] & 0x3ffffffu;
             if (bytes == 0) return;
+            if (dmaDestination(packet) == 2u && dmaSource(packet) != 2u && address(packet[2], packet[3]) == address(packet[4], packet[5])) return;
             auto data = dmaSourceBytes(packet);
             const auto destination = dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
             GuestMemory::CheckRange(reinterpret_cast<void*>(destination), bytes, 1, true);

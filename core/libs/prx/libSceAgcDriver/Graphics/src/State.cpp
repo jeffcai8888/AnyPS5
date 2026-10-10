@@ -1,3 +1,4 @@
+#include <mutex>
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -736,7 +737,21 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
-    Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
+    if (slice != ((view >> 13u) & 0x1fffu)) {
+        // Layered color targets (slice ranges) need framebuffer layer counts the reference path
+        // does not build yet; APS5_FIRST_SLICE_ONLY renders the first slice to keep running.
+        static const bool firstSliceOnly = std::getenv("APS5_FIRST_SLICE_ONLY") != nullptr;
+        static std::once_flag reported;
+        if (firstSliceOnly) {
+            std::call_once(reported, [] {
+                std::fprintf(stderr, "[gpu] APS5_FIRST_SLICE_ONLY: multi-slice color views render their first slice only\n");
+            });
+        } else {
+            char detail[128];
+            std::snprintf(detail, sizeof(detail), "color views of several array slices are unsupported (CB_COLOR_VIEW 0x%08x: slices %u..%u, slot %u)", view, slice, (view >> 13u) & 0x1fffu, slot);
+            Require(false, detail);
+        }
+    }
     const auto viewMip = (view >> 26u) & 0xfu;
     zero(cx, 0x31d + stride, ~0u, "color samples, fragments or destination alpha override");
     const auto attrib2 = read(cx, 0x3b0 + slot);

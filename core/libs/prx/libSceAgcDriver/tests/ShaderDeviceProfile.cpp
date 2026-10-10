@@ -160,7 +160,7 @@ void CheckHeaps() {
             image.dimension = dimension;
             const auto binding = DescriptorBindingForImage(image);
             Require(classes.insert(static_cast<std::uint32_t>(binding)).second, "typed image classes overlap");
-            Require(RuntimeAbi::HeapCapacity(binding) == (group < 4u ? RuntimeAbi::SampledHeapCapacity : RuntimeAbi::StorageHeapCapacity), "typed image class has an invalid capacity");
+            Require(RuntimeAbi::HeapCapacity(binding) == (group < 4u ? RuntimeAbi::SampledHeapCapacity : RuntimeAbi::StorageHeapCapacity * RuntimeAbi::StorageHeapRoots), "typed image class has an invalid capacity");
         }
     }
     Require(classes.size() == RuntimeAbi::ImageBindingCount && *classes.begin() == 1u && *classes.rbegin() == RuntimeAbi::ImageBindingCount, "typed image class mapping is incomplete");

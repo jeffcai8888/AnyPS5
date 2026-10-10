@@ -181,6 +181,9 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             if (observed) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
             const auto waitsBefore = observed ? hookWaits() : 0;
             const auto started = page.wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            // An unmapped read (a null or unbound descriptor the shader chases) answers "not readable"
+            // so the resource walk degrades to its dynamic path instead of failing the dispatch.
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) return false;
             GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
             if (page.wordwise) {
                 const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());

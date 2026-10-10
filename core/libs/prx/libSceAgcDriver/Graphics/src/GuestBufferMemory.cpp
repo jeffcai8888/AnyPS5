@@ -2607,15 +2607,41 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     const auto* found = owner(address);
     Require(found != nullptr, "guest buffer has no GPU owner");
     const auto& region = *found;
-    Require(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr), "guest buffer view exceeds its GPU owner");
+    const auto end = region.direct != nullptr ? region.direct->base + region.direct->bytes : region.end;
+    if (address >= end) {
+        char detail[192];
+        std::snprintf(detail, sizeof(detail), "guest buffer view exceeds its GPU owner: view 0x%llx, region 0x%llx..0x%llx",
+            static_cast<unsigned long long>(address), static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(end));
+        Require(false, detail);
+    }
+    if (address + bytes > end) {
+        // Titles size V#s by allocation buckets while the GPU owner ends at the real allocation
+        // boundary; out-of-bounds reads answer zeros on the hardware. Keep the view inside its
+        // owner and let the shader's tail reads fall where they may.
+        static std::mutex clampMutex;
+        static std::set<std::pair<std::uint64_t, std::uint64_t>> clamped;
+        std::lock_guard lock(clampMutex);
+        if (clamped.insert({address, bytes}).second) {
+            std::fprintf(stderr, "[gpu] buffer view 0x%llx + 0x%zx clamped to its GPU owner 0x%llx..0x%llx\n",
+                static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(end));
+        }
+        bytes = static_cast<std::size_t>(end - address);
+        Require(bytes != 0, "guest buffer view is empty after clamping to its GPU owner");
+    }
+    Require(region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr, "guest buffer view exceeds its GPU owner");
     const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
     const auto offset = address - base;
     Require(context.limits.minStorageBufferOffsetAlignment != 0, "no storage buffer offset alignment");
     Require(base % 4 == 0, "a guest buffer view in a GPU owner that does not start at a DWORD boundary is not implemented");
     adjustment = static_cast<std::uint32_t>(offset % std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
     const auto range = ViewBytes(bytes, adjustment);
-    const auto end = region.direct != nullptr ? region.direct->base + region.direct->bytes : region.end;
-    Require(address - adjustment + range <= end, "guest buffer view exceeds its GPU owner");
+    if (address - adjustment + range > end) {
+        char detail[256];
+        std::snprintf(detail, sizeof(detail), "guest buffer view exceeds its GPU owner (aligned): view 0x%llx + 0x%zx adj %u range 0x%llx, region 0x%llx..0x%llx",
+            static_cast<unsigned long long>(address), bytes, adjustment, static_cast<unsigned long long>(range),
+            static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(end));
+        Require(false, detail);
+    }
     Require(range <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
     const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
     return {handle, offset - adjustment, range};

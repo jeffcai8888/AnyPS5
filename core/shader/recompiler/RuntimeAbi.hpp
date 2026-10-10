@@ -34,8 +34,13 @@ enum class Stage : std::uint32_t { Main, Fragment, TessellationControl, Tessella
 inline constexpr std::uint32_t UserDataCapacity = 128u;
 inline constexpr std::uint32_t BufferCapacity = 128u;
 inline constexpr std::uint32_t ImageCapacity = 256u;
-inline constexpr std::uint32_t SampledHeapCapacity = 16u;
+// UE5 titles bind material and bindless groups larger than one table's default; both heaps size
+// the per-binding descriptor arrays and the runtime metadata they index.
+inline constexpr std::uint32_t SampledHeapCapacity = 32u;
+// StorageHeapCapacity is the mip-slot count of one dynamic storage image; a binding group holds
+// several such roots plus single-slot static images.
 inline constexpr std::uint32_t StorageHeapCapacity = 4u;
+inline constexpr std::uint32_t StorageHeapRoots = 16u;
 inline constexpr std::uint32_t SamplerHeapCapacity = 16u;
 
 struct ResourceMetadata {
@@ -68,7 +73,7 @@ inline constexpr std::uint32_t ShaderDataDwords = sizeof(ShaderData) / sizeof(st
 inline std::uint32_t HeapCapacity(Binding binding) {
     const auto value = static_cast<std::uint32_t>(binding);
     if (value >= FirstImageBinding && value < FirstStorageImageBinding) return SampledHeapCapacity;
-    if (value >= FirstStorageImageBinding && value < static_cast<std::uint32_t>(Binding::Samplers)) return StorageHeapCapacity;
+    if (value >= FirstStorageImageBinding && value < static_cast<std::uint32_t>(Binding::Samplers)) return StorageHeapCapacity * StorageHeapRoots;
     if (binding == Binding::Samplers) return SamplerHeapCapacity;
     throw std::runtime_error("Shader runtime ABI: binding is not a typed heap");
 }
