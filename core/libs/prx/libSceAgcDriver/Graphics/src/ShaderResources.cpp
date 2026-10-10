@@ -1134,6 +1134,23 @@ void ShaderResources::Complete() {
     forgetDeferredInputs();
 }
 
+std::uint64_t ShaderResources::PinnedBytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto& texture : textures) {
+        if (texture == nullptr) continue;
+        // A view of a storage image pins nothing of its own; the source counts below.
+        bytes += texture->ViewsStorageImage() ? 0u : texture->AllocationBytes();
+    }
+    for (const auto& storage : storageTextures) {
+        if (storage == nullptr) continue;
+        // Shared sources count fractionally: every holder pins the same allocation, and the cache
+        // evicting one holder does not free it while another lives.
+        const auto holders = storage.use_count();
+        bytes += holders != 0 ? storage->GuestBytes() / holders : storage->GuestBytes();
+    }
+    return bytes;
+}
+
 void ShaderResources::forgetDeferredInputs() {
     // The compiled shader and the captured regions belong to the dispatch, which returns while this
     // object lives on in the resource cache and the recorder: nothing may reach for them after the
@@ -2633,21 +2650,38 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     if (!resources->HasCachedStorageImages()) return;
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
+        trackedBytes -= found->second->second != nullptr ? found->second->second->PinnedBytes() : 0u;
         entries.erase(found->second);
         index.erase(found);
     }
+    trackedBytes += resources != nullptr ? resources->PinnedBytes() : 0u;
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
+    // Entries pin their textures and storage images past the texture caches' budgets. The byte
+    // budget (APS5_RESOURCE_CACHE_MIB, default 4096, 0 disables) releases the least recently used
+    // entries once their pinned device memory exceeds it, so a title with a large streaming working
+    // set evicts by footprint instead of thrashing a fixed entry count; the entry count
+    // (APS5_RESOURCE_CACHE_ENTRIES, default 1024) still bounds the metadata.
+    static const std::uint64_t budgetBytes = [] {
+        const char* value = std::getenv("APS5_RESOURCE_CACHE_MIB");
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 4096ull;
+        return parsed * (1024ull * 1024ull);
+    }();
     static const std::size_t capacity = [] {
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 1024ull;
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
-    while (entries.size() > capacity) {
-        if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
-        index.erase(entries.back().first);
+    while ((!entries.empty() && budgetBytes != 0u && trackedBytes > budgetBytes && entries.size() > 1) || entries.size() > capacity) {
+        auto& [evictKey, evictedResources] = entries.back();
+        trackedBytes -= evictedResources != nullptr ? evictedResources->PinnedBytes() : 0u;
+        if (evicted != nullptr) evicted->push_back(std::move(evictedResources));
+        index.erase(evictKey);
         entries.pop_back();
     }
+    static std::atomic<std::uint64_t> inserts{0};
+    const auto count = inserts.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 5 || count % 500 == 0) std::fprintf(stderr, "[rescache] insert %llu: %zu entries, %llu MiB tracked, entry pins %llu MiB\n", static_cast<unsigned long long>(count), entries.size(), trackedBytes >> 20u, (entries.front().second != nullptr ? entries.front().second->PinnedBytes() : 0ull) >> 20u);
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
@@ -2693,6 +2727,7 @@ void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
     index.clear();
     entries.clear();
+    trackedBytes = 0;
 }
 
 std::size_t ResourceCache::Size() const {
@@ -2703,6 +2738,7 @@ std::size_t ResourceCache::Size() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    trackedBytes -= found->second->second != nullptr ? found->second->second->PinnedBytes() : 0u;
     entries.erase(found->second);
     index.erase(found);
 }

@@ -167,6 +167,9 @@ public:
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }
+    // The device memory this object pins (its storage images' and own-image textures' allocations),
+    // for the resource cache's byte budget; storage sources several objects share count fractionally.
+    std::uint64_t PinnedBytes() const;
     // Whether a region the recorded work reads in place through a host import overlaps the range.
     bool ReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     // The recorder's hazard tracker inputs (Recorder::NoteAccess): the written elements' guest
@@ -578,6 +581,8 @@ private:
     mutable std::mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    // Sum of the entries' PinnedBytes (see Insert's byte budget).
+    std::uint64_t trackedBytes = 0;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears
