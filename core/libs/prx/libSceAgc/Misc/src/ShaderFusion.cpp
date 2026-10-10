@@ -1,3 +1,16 @@
+#include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+namespace {
+void TraceAgcCall(const char* fn, const void* a, const void* b) {
+    static const bool trace = std::getenv("APS5_TRACE_AGC") != nullptr;
+    if (trace) std::fprintf(stderr, "[agc] t%lu %s a=%p b=%p\n", GetCurrentThreadId(), fn, a, b);
+}
+}
+
 #include "prx/libSceAgc/Misc/include/ShaderFusion.hpp"
 
 #include <algorithm>
@@ -253,6 +266,7 @@ int FuseGeometryHalves(Shader* fused_result, const Shader* front, const Shader* 
 extern "C" {
 
 int APS5_VABI sceAgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front, const Shader* back, void* scratch_mem) {
+    TraceAgcCall(__func__, nullptr, nullptr);
     if (fused_result == nullptr || front == nullptr || back == nullptr) APS5_INVALID_ARG_EX;
     if (!ValidHalves(front, back)) return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
     const bool isGs = GeometryHalves(front);
@@ -302,6 +316,7 @@ int APS5_VABI sceAgcFuseShaderHalves_nid_postfix(Shader* fused_result, const Sha
 }
 
 int APS5_VABI sceAgcGetFusedShaderSize_0080(SizeAlign* dst, const Shader* front, const Shader* back) {
+    TraceAgcCall(__func__, nullptr, nullptr);
     if (dst == nullptr || front == nullptr || back == nullptr) APS5_INVALID_ARG_EX;
     if (!ValidHalves(front, back)) return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
     if (GeometryHalves(front)) {

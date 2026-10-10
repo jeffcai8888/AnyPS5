@@ -23,7 +23,9 @@
 #include <functional>
 #include <list>
 #include <atomic>
+#include <mutex>
 #include <pthread.h>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -348,6 +350,20 @@ std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& reg
     return {};
 }
 
+// RegisteredHeader, falling back to the code identity: title runtimes (UE5's PSO precache) pass
+// stack or heap copies of a registered header with patched fields, which SameHeader refuses.
+std::shared_ptr<const ShaderSnapshot> RegisteredHeaderOrCopy(const ShaderRegistry& registry, const Shader* shader, const char* abi) {
+    if (auto snapshot = RegisteredHeader(registry, shader)) return snapshot;
+    const auto code = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(GuestShaderFields(shader).code));
+    const auto found = registry.find(code);
+    if (found == registry.end() || found->second.empty()) return {};
+    static std::mutex reportedMutex;
+    static std::set<std::uint64_t> reported;
+    std::lock_guard lock(reportedMutex);
+    if (reported.insert(code).second) std::fprintf(stderr, "[gpu] %s ABI header 0x%llx is a patched copy of registered shader 0x%llx; resolving by code identity\n", abi, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)), static_cast<unsigned long long>(code));
+    return found->second.back();
+}
+
 std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
     auto found = registry.upper_bound(address);
     if (found == registry.begin()) return {};
@@ -625,7 +641,8 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     std::uint32_t resourceRegister;
     std::uint32_t firstUser = 0;
     Stage stage;
-    switch (snapshot.type) {
+    try {
+        switch (snapshot.type) {
     case 0: stage = Stage::Compute; programRegister = 0x20c; resourceRegister = 0x213; break;
     case 1: stage = Stage::Fragment; programRegister = 0x008; resourceRegister = 0x00b; break;
     case 2: stage = Stage::Vertex; programRegister = 0x0c8; resourceRegister = 0x08b; firstUser = 8; break;
@@ -755,6 +772,11 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         append();
     }
     return entries;
+    } catch (const std::exception& error) {
+        char context[96];
+        std::snprintf(context, sizeof(context), " (preparing registered shader 0x%llx type %u)", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.type);
+        throw std::runtime_error(error.what() + std::string(context));
+    }
 }
 
 std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
@@ -1021,7 +1043,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             const auto fields = GuestShaderFields(shader);
             const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code));
             require(registry != nullptr && registry->contains(address), "graphics ABI refers to an unregistered shader");
-            const auto selected = RegisteredHeader(*registry, shader);
+            const auto selected = RegisteredHeaderOrCopy(*registry, shader, "graphics");
             require(selected != nullptr, "graphics ABI refers to a replaced shader header");
             if (owner == nullptr) owner = selected;
             const auto& snapshot = *selected;
@@ -1098,7 +1120,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         std::lock_guard lock(mutex);
         const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code));
         require(shaders != nullptr && shaders->contains(address), "static ABI refers to an unregistered shader");
-        snapshot = RegisteredHeader(*shaders, shader);
+        snapshot = RegisteredHeaderOrCopy(*shaders, shader, "static");
         require(snapshot != nullptr, "static ABI refers to a replaced shader header");
     }
     require(snapshot->registeredState != nullptr, "registered shader state is missing");
@@ -1166,7 +1188,7 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
         const auto lookup = [&](const Shader* shader) {
             const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(GuestShaderFields(shader).code));
             require(shaders != nullptr && shaders->contains(address), "rectangle ABI refers to an unregistered shader");
-            const auto snapshot = RegisteredHeader(*shaders, shader);
+            const auto snapshot = RegisteredHeaderOrCopy(*shaders, shader, "rectangle");
             require(snapshot != nullptr, "rectangle ABI refers to a replaced shader header");
             return snapshot;
         };
@@ -1266,6 +1288,12 @@ void Driver::RegisterShader(const Shader* shader) {
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
     std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    // Experiment switch: drop type-8 (Fs) registrations entirely to test crash correlation.
+    if (fields.type == 8u && std::getenv("APS5_SKIP_FS") != nullptr) {
+        static std::once_flag once;
+        std::call_once(once, [] { std::fprintf(stderr, "[gpu] APS5_SKIP_FS: type-8 registration dropped\n"); });
+        return;
+    }
     require(fields.file_header == 0x34333231u && fields.version == 0x18u, "invalid shader header");
     require(fields.header_size >= sizeof(Shader), "shader header is smaller than its fixed fields");
     require(fields.shader_size != 0 && (fields.shader_size & 3u) == 0, "invalid shader size");

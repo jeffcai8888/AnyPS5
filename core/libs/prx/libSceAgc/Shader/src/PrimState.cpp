@@ -1,6 +1,18 @@
 #include "prx/libSceAgc/Shader/include/PrimState.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+namespace {
+void TraceAgcCall(const char* fn, const void* a, const void* b) {
+    static const bool trace = std::getenv("APS5_TRACE_AGC") != nullptr;
+    if (trace) std::fprintf(stderr, "[agc] t%lu %s a=%p b=%p\n", GetCurrentThreadId(), fn, a, b);
+}
+}
+
 #include <array>
 #include <algorithm>
 #include <stdexcept>
@@ -26,6 +38,7 @@ void RequireSpecialOffset(const ShaderRegister& reg, std::uint32_t expected, con
 extern "C" {
 
 int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs, const Shader* hs, const Shader* gs, std::uint32_t prim_type) {
+    TraceAgcCall(__func__, nullptr, nullptr);
     if (cx_regs == nullptr && uc_regs == nullptr) {
         return 0;
     }

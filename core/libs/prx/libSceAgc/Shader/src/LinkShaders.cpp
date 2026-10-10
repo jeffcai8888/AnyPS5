@@ -5,6 +5,11 @@
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include <array>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" int APS5_VABI sceAgcCreatePrimState(ShaderRegister*, ShaderRegister*, const Shader*, const Shader*, std::uint32_t);
 extern "C" int APS5_VABI sceAgcCreateInterpolantMapping_0100(ShaderRegister*, const Shader*, const Shader*);
@@ -12,6 +17,15 @@ extern "C" int APS5_VABI sceAgcCreateInterpolantMapping_0100(ShaderRegister*, co
 extern "C" int APS5_VABI sceAgcLinkShaders(ShaderRegister* context, ShaderRegister* primitive,
     const void* reserved, const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
     using namespace ShaderRegs;
+#ifdef _WIN32
+    {
+        static const bool trace = std::getenv("APS5_TRACE_AGC") != nullptr;
+        if (trace) {
+            std::fprintf(stderr, "[agc] t%lu LinkShaders vertex=%p (type %u code=%p) pixel=%p prim=%u\n",
+                GetCurrentThreadId(), vertex, vertex ? vertex->type : 255, vertex ? const_cast<const void*>(vertex->code) : nullptr, pixel, primitiveType);
+        }
+    }
+#endif
     if (!context || !primitive || reserved || !vertex ||
         vertex->type != static_cast<std::uint8_t>(ShaderBinaryType::Gs) ||
         (vertex->num_output_semantics && !vertex->output_semantics) ||
