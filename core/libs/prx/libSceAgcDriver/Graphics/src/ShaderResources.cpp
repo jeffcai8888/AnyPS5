@@ -356,6 +356,32 @@ std::uint64_t storageBudget(const Context& context) {
     return forced != 0 ? forced : TextureCacheBudget(context.memory);
 }
 
+// Whether the device-local heap is within a margin of full (live VK_EXT_memory_budget read, cached
+// for a second): the texture caches yield entries before a new image's vkAllocateMemory fails on a
+// full device — their images are re-uploads, the cheapest video memory to give back, whichever
+// consumer spent it.
+bool DeviceHeapTight(const Context& context, std::uint64_t incoming) {
+    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return false;
+    static std::mutex mutex;
+    static VkPhysicalDevice device = VK_NULL_HANDLE;
+    static VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    static VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    static std::chrono::steady_clock::time_point readAt{};
+    std::lock_guard lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (device != context.physical || now - readAt > std::chrono::seconds(1)) {
+        reported = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+        context.memoryProperties2(context.physical, &properties);
+        device = context.physical;
+        readAt = now;
+    }
+    const auto heap = largestDeviceLocalHeap(properties.memoryProperties);
+    if (!heap) return false;
+    constexpr std::uint64_t margin = 256ull << 20u;
+    return reported.heapBudget[*heap] < reported.heapUsage[*heap] + incoming + margin;
+}
+
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     if (const auto forced = forcedCacheBudget(); forced != 0) return forced;
     if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
@@ -534,18 +560,30 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
         ReadTextureSurface(resource, *keys, entry.bytes);
+        // Evict before the constructor allocates (see cachedStorageTexture): the sampled cache
+        // yields on its own budget or on device-wide pressure, where its images are the cheapest
+        // video memory to give back.
+        const auto preBudget = sampledBudget(context, cache);
+        while (!cache.entries.empty() && (cache.bytes + bytes > preBudget || DeviceHeapTight(context, bytes))) eraseTexture(cache, std::prev(cache.entries.end()));
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
             for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
-        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        try {
+            entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        } catch (const std::exception&) {
+            // Device out of video memory: yield half of the cache (re-uploadable images) and retry.
+            const auto half = cache.entries.size() / 2u;
+            for (std::size_t i = 0; i < half && !cache.entries.empty(); ++i) eraseTexture(cache, std::prev(cache.entries.end()));
+            entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        }
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     const auto budget = sampledBudget(context, cache);
-    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) eraseTexture(cache, std::prev(cache.entries.end()));
+    while (!cache.entries.empty() && (cache.bytes + entry.accounted > budget || DeviceHeapTight(context, entry.accounted))) eraseTexture(cache, std::prev(cache.entries.end()));
     cache.bytes += entry.accounted;
     auto texture = entry.texture;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
@@ -711,8 +749,24 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     // Refresh flushes them, the constructor's upload does not, and a GPU-direct upload reads the
     // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    // Evict BEFORE the constructor allocates: once the device is full, the new image's
+    // vkAllocateMemory fails before any post-construction bookkeeping could help it. The cache's
+    // own budget evicts first; a tight device (whatever the consumer) evicts too — cached storage
+    // images are re-uploads, the cheapest video memory to give back.
+    const auto preBudget = storageBudget(context);
+    while (!cache.entries.empty() && (cache.bytes + guestBytes > preBudget || DeviceHeapTight(context, guestBytes))) evictStorage(cache, std::prev(cache.entries.end()));
     if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
-    CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
+    CachedStorageTexture entry{key, mip, nullptr};
+    try {
+        entry.texture = std::make_shared<StorageTexture>(context, *context.detiler, resource, mip);
+    } catch (const std::exception&) {
+        // The device is out of video memory (the pre-construction eviction above cannot see every
+        // consumer): yield half of the cache — its images are re-uploads, the cheapest memory to
+        // give back — and retry once before failing the draw.
+        const auto half = cache.entries.size() / 2u;
+        for (std::size_t i = 0; i < half && !cache.entries.empty(); ++i) evictStorage(cache, std::prev(cache.entries.end()));
+        entry.texture = std::make_shared<StorageTexture>(context, *context.detiler, resource, mip);
+    }
     // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
     // detile) before the image could keep itself (no weak_from_this yet): the batch keeps it here,
     // so an eviction or a failed view before it ran cannot destroy a referenced image.
