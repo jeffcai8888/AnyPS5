@@ -488,30 +488,65 @@ std::uint64_t storageBudget(const Context& context) {
     return forced != 0 ? forced : TextureCacheBudget(context.memory);
 }
 
-// Whether the device-local heap is within a margin of full (live VK_EXT_memory_budget read, cached
-// for a second): the texture caches yield entries before a new image's vkAllocateMemory fails on a
-// full device — their images are re-uploads, the cheapest video memory to give back, whichever
-// consumer spent it.
-bool DeviceHeapTight(const Context& context, std::uint64_t incoming) {
-    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return false;
-    static std::mutex mutex;
-    static VkPhysicalDevice device = VK_NULL_HANDLE;
-    static VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-    static VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
-    static std::chrono::steady_clock::time_point readAt{};
-    std::lock_guard lock(mutex);
+// How far the device-local heap is from fitting `incoming` plus a margin (live VK_EXT_memory_budget
+// read, cached for a second): the texture caches yield entries before a new image's
+// vkAllocateMemory fails on a full device — their images are re-uploads, the cheapest video memory
+// to give back, whichever consumer spent it. The deficit is net of what the caches yielded since the
+// read: a stale "tight" reading must not empty a whole cache on every miss.
+struct DeviceHeapReading {
+    std::mutex mutex;
+    VkPhysicalDevice device = VK_NULL_HANDLE;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    std::chrono::steady_clock::time_point readAt{};
+    std::uint64_t yielded = 0;
+};
+
+DeviceHeapReading& DeviceHeap() {
+    static DeviceHeapReading reading;
+    return reading;
+}
+
+std::uint64_t DeviceHeapDeficit(const Context& context, std::uint64_t incoming) {
+    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return 0;
+    auto& reading = DeviceHeap();
+    std::lock_guard lock(reading.mutex);
     const auto now = std::chrono::steady_clock::now();
-    if (device != context.physical || now - readAt > std::chrono::seconds(1)) {
-        reported = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-        properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
-        context.memoryProperties2(context.physical, &properties);
-        device = context.physical;
-        readAt = now;
+    if (reading.device != context.physical || now - reading.readAt > std::chrono::seconds(1)) {
+        reading.reported = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        reading.properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reading.reported};
+        context.memoryProperties2(context.physical, &reading.properties);
+        reading.device = context.physical;
+        reading.readAt = now;
+        reading.yielded = 0;
     }
-    const auto heap = largestDeviceLocalHeap(properties.memoryProperties);
-    if (!heap) return false;
+    const auto heap = largestDeviceLocalHeap(reading.properties.memoryProperties);
+    if (!heap) return 0;
     constexpr std::uint64_t margin = 256ull << 20u;
-    return reported.heapBudget[*heap] < reported.heapUsage[*heap] + incoming + margin;
+    const auto needed = reading.reported.heapUsage[*heap] + incoming + margin;
+    const auto available = reading.reported.heapBudget[*heap] + reading.yielded;
+    return needed > available ? needed - available : 0u;
+}
+
+void NoteDeviceHeapYield(std::uint64_t bytes) {
+    auto& reading = DeviceHeap();
+    std::lock_guard lock(reading.mutex);
+    reading.yielded += bytes;
+}
+
+// Evicts from the back of `cache` until `incoming` fits its budget and the device-local heap's
+// deficit is covered by the bytes the evictions released.
+template <typename Cache, typename Evict>
+void evictForIncoming(const Context& context, Cache& cache, std::uint64_t incoming, std::uint64_t budget, Evict evict) {
+    auto deficit = DeviceHeapDeficit(context, incoming);
+    while (!cache.entries.empty() && (cache.bytes + incoming > budget || deficit != 0)) {
+        const std::uint64_t before = cache.bytes;
+        evict(cache, std::prev(cache.entries.end()));
+        const std::uint64_t after = cache.bytes;
+        const auto freed = before > after ? before - after : 0u;
+        deficit -= std::min(deficit, freed);
+        NoteDeviceHeapYield(freed);
+    }
 }
 
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
@@ -715,7 +750,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         // Evict before the constructor allocates (see cachedStorageTexture): under device-wide
         // pressure the sampled cache's images are the cheapest video memory to give back. Its own
         // budget is admitTexture's.
-        while (!cache.entries.empty() && DeviceHeapTight(context, bytes)) eraseTexture(cache, std::prev(cache.entries.end()));
+        evictForIncoming(context, cache, bytes, std::numeric_limits<std::uint64_t>::max(), eraseTexture);
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
@@ -911,7 +946,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             // Evict BEFORE the constructor allocates: once the device is full, the new image's
             // vkAllocateMemory fails before any post-construction bookkeeping could help it. Cached
             // storage images are re-uploads, the cheapest video memory to give back.
-            while (!cache.entries.empty() && DeviceHeapTight(context, guestBytes)) evicted.push_back(evictStorage(cache, std::prev(cache.entries.end())));
+            evictForIncoming(context, cache, guestBytes, std::numeric_limits<std::uint64_t>::max(), [&](StorageTextureCache& storage, std::list<CachedStorageTexture>::iterator it) { evicted.push_back(evictStorage(storage, it)); });
             if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
             CachedStorageTexture entry{key, mip, nullptr};
             try {
@@ -2699,13 +2734,14 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     std::lock_guard lock(mutex);
     if (!resources->HasCachedStorageImages()) return;
     if (const auto found = index.find(key); found != index.end()) {
+        trackedBytes -= std::min(trackedBytes, found->second->pinned);
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
-        trackedBytes -= found->second->second != nullptr ? found->second->second->PinnedBytes() : 0u;
         entries.erase(found->second);
         index.erase(found);
     }
-    trackedBytes += resources != nullptr ? resources->PinnedBytes() : 0u;
-    entries.emplace_front(key, std::move(resources));
+    const auto pinned = resources != nullptr ? resources->PinnedBytes() : 0u;
+    trackedBytes += pinned;
+    entries.push_front(Entry{key, std::move(resources), pinned});
     index.emplace(key, entries.begin());
     // Entries pin their textures and storage images past the texture caches' budgets. The byte
     // budget (APS5_RESOURCE_CACHE_MIB, default 4096, 0 disables) releases the least recently used
@@ -2723,10 +2759,10 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while ((!entries.empty() && budgetBytes != 0u && trackedBytes > budgetBytes && entries.size() > 1) || entries.size() > capacity) {
-        auto& [evictKey, evictedResources] = entries.back();
-        trackedBytes -= evictedResources != nullptr ? evictedResources->PinnedBytes() : 0u;
-        if (evicted != nullptr) evicted->push_back(std::move(evictedResources));
-        index.erase(evictKey);
+        auto& last = entries.back();
+        trackedBytes -= std::min(trackedBytes, last.pinned);
+        if (evicted != nullptr) evicted->push_back(std::move(last.second));
+        index.erase(last.first);
         entries.pop_back();
     }
     static std::atomic<std::uint64_t> inserts{0};
@@ -2788,7 +2824,7 @@ std::size_t ResourceCache::Size() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
-    trackedBytes -= found->second->second != nullptr ? found->second->second->PinnedBytes() : 0u;
+    trackedBytes -= std::min(trackedBytes, found->second->pinned);
     entries.erase(found->second);
     index.erase(found);
 }

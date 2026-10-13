@@ -578,10 +578,17 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
+    // `pinned` is the entry's PinnedBytes at insertion: PinnedBytes moves with the holder counts of
+    // shared storage images, so removal subtracts what insertion added.
+    struct Entry {
+        Key first;
+        std::shared_ptr<ShaderResources> second;
+        std::uint64_t pinned = 0;
+    };
     mutable std::mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
+    std::list<Entry> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
-    // Sum of the entries' PinnedBytes (see Insert's byte budget).
+    // Sum of the entries' pinned bytes (see Insert's byte budget).
     std::uint64_t trackedBytes = 0;
 };
 
