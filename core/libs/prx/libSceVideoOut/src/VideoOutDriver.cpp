@@ -703,6 +703,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                         schedule = due;
                         while (std::chrono::steady_clock::now() < due) std::this_thread::yield();
                     }
+                }
                 int windowWidth = 0;
                 int windowHeight = 0;
                 if (window.Handle() != nullptr) SDL_GetWindowSize(window.Handle(), &windowWidth, &windowHeight);
