@@ -43,13 +43,8 @@ void verifyBarrierWithoutMemory() {
 }
 
 void verifyBarrierWithLds() {
-    try {
-        (void)ShaderRecompiler::Recompile(vertexRequest(BarrierLdsExport));
-    } catch (const std::exception& error) {
-        if (std::string(error.what()).find("s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented") != std::string::npos) return;
-        throw;
-    }
-    throw std::runtime_error("a vertex program with s_barrier and an LDS write compiled");
+    const auto result = ShaderRecompiler::Recompile(vertexRequest(BarrierLdsExport));
+    if (!hasControlBarrier(result)) throw std::runtime_error("a vertex program's s_barrier over LDS was dropped");
 }
 
 } // namespace

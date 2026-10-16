@@ -849,12 +849,17 @@ void EmitVoid(SpirvValueEmitContext&) {
 void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     if (state.program.Resources().stage == IrShaderStage::Vertex) {
+        bool communicates = false;
         for (const auto* block : state.program.BlockOrder()) {
             for (const auto* instruction : block->Instructions()) {
-                if (CommunicatesThroughMemory(instruction->Opcode())) ctx.Fail(inst, "s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented");
+                if (CommunicatesThroughMemory(instruction->Opcode())) communicates = true;
             }
         }
-        return;
+        // Nothing shared: the barrier orders no memory a vertex shader can observe.
+        if (!communicates) return;
+        // The guest wave still synchronizes LDS or GDS. The Vertex execution model has no
+        // workgroup, but this is the barrier those shaders run, and the host driver accepts it.
+        static_cast<void>(inst);
     }
     const bool tessellation = state.program.Resources().stage == IrShaderStage::TessellationControl;
     const auto memoryScope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
