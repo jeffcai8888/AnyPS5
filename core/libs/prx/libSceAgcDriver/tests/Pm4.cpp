@@ -203,7 +203,9 @@ void testContextAndBases() {
     expectFailure([] { static_cast<void>(AgcDriver::Pm4::PartialGroupThreads({0x10002, 1, 1}, {0x0001ffff, 0x00010001, 0x00010001})); }, "exceeds 32 bits");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x15, {1, 1, 1, 0x2063}, 2), 0); }, "dispatch modifiers");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x15, {1, 1, 1, 0x41}, 4), 0); }, "header flags");
-    expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x15, {1, 1, 1, 0x49}), 0); }, "dispatch modifiers");
+    AgcDriver::Pm4::Validate(makePacket(0x15, {1, 1, 1, 0x49}), 0);
+    AgcDriver::Pm4::Validate(makePacket(0x16, {0, 0x49}), 0);
+    expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x15, {1, 1, 1, 0x59}), 0); }, "dispatch modifiers");
     execute(state, makePacket(0x13, {32}));
     execute(state, makePacket(0x26, {0x1000, 1}));
     execute(state, makePacket(0x2a, {1}));

@@ -11,6 +11,7 @@
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -24,12 +25,14 @@
 #include <list>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <pthread.h>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include "RdnaDecoder/RdnaOpcode.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -450,24 +453,15 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     return handle;
 }
 
-ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, const ShaderRecompiler::CompiledShaderArtifact& vertex, const ShaderRecompiler::CompiledShaderArtifact& fragment, const ShaderRecompiler::SpirvTarget& target) {
+ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId) {
     std::lock_guard lock(snapshot.prepared->mutex);
     for (const auto& entry : snapshot.prepared->rectangles) {
-        if (entry.vertexId == vertex.variantId && entry.fragmentId == fragment.variantId) {
+        if (entry.vertexId == vertexId && entry.fragmentId == fragmentId) {
             require(entry.shaders != nullptr, "prepared rectangle artifact is missing");
             return *entry.shaders;
         }
     }
-    // A draw can pair artifacts the resolve-time rectangle build never saw (a variant prepared
-    // later, or a resolve deduplicated by its ABI key); build the pair here.
-    ShaderRecompiler::RecompileResult vertexResult;
-    ShaderRecompiler::RecompileResult fragmentResult;
-    static_cast<ShaderRecompiler::CompiledShaderArtifact&>(vertexResult) = vertex;
-    static_cast<ShaderRecompiler::CompiledShaderArtifact&>(fragmentResult) = fragment;
-    auto built = std::make_shared<const ShaderRecompiler::RectListShaders>(ShaderRecompiler::BuildRectListShaders(vertexResult, fragmentResult, target));
-    const auto result = *built;
-    snapshot.prepared->rectangles.push_back({vertex.variantId, fragment.variantId, std::move(built)});
-    return result;
+    throw std::runtime_error("AGC driver: prepared rectangle artifacts are missing");
 }
 
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint64_t vertexId, std::uint64_t fragmentId, const ShaderRecompiler::SpirvTarget& target) {
@@ -509,26 +503,164 @@ std::vector<std::uint32_t> ReadUserDataCallee(std::uint64_t address, std::uint32
     throw std::runtime_error("its callee at " + hexText(address) + " does not return within " + std::to_string(limitWords * 4u) + " bytes");
 }
 
+// Evaluates the s_mov / s_load / s_buffer_load chain that produces an s_swappc_b64 target in the
+// straight-line code before the call (no branch lands between its start and the call), reading guest
+// memory as the wave would when the dispatch runs. Any other scalar write forgets its registers.
+std::optional<std::uint64_t> MemoryCallTarget(const ShaderRecompiler::RdnaProgram& program, std::size_t call, std::string& why, std::optional<std::uint64_t>& unmapped) {
+    using ShaderRecompiler::RdnaOpcode;
+    using ShaderRecompiler::RdnaOperandKind;
+    const auto callCounter = program.instructions[call].programCounter;
+    std::uint32_t start = 0;
+    for (const auto& instruction : program.instructions) {
+        const bool callsBack = instruction.op == RdnaOpcode::SCallB64 || instruction.op == RdnaOpcode::SSwappcB64;
+        if (ShaderRecompiler::IsDirectBranchOpcode(instruction.op) || instruction.op == RdnaOpcode::SCallB64) {
+            if (instruction.branchTarget <= callCounter) start = std::max(start, instruction.branchTarget);
+        }
+        if (callsBack && instruction.programCounter < callCounter) start = std::max(start, instruction.programCounter + instruction.wordCount * 4u);
+    }
+    std::array<std::optional<std::uint32_t>, 108> sgpr{};
+    const auto source = [&](const ShaderRecompiler::RdnaInstruction& instruction, std::uint32_t code) -> std::optional<std::uint32_t> {
+        if (code < sgpr.size()) return sgpr[code];
+        if (code >= 128u && code <= 192u) return code - 128u;
+        if (code >= 193u && code <= 208u) return static_cast<std::uint32_t>(192 - static_cast<std::int32_t>(code));
+        if (code == 255u && instruction.wordCount > 1u) return instruction.rawWords[1];
+        return std::nullopt;
+    };
+    const auto forget = [&](const ShaderRecompiler::RdnaOperand& operand, std::uint32_t count) {
+        std::uint32_t first = sgpr.size();
+        if (operand.kind == RdnaOperandKind::ScalarRegister) first = operand.reg;
+        if (operand.kind == RdnaOperandKind::VccLo || operand.kind == RdnaOperandKind::VccHi) first = 106u;
+        for (std::uint32_t reg = first; reg < std::min<std::size_t>(first + count, sgpr.size()); ++reg) sgpr[reg].reset();
+    };
+    // The PS5 system maps the hook tables these calls go through; the emulator does not, and an
+    // unmapped table reads as zero, which is what a table with no hook installed holds.
+    const auto load = [&](const ShaderRecompiler::RdnaInstruction& instruction, std::optional<std::uint64_t> address, std::uint32_t first, std::uint32_t count, std::uint32_t validWords) {
+        std::array<std::uint32_t, 16> words{};
+        const auto readWords = std::min(count, validWords);
+        const bool readable = address.has_value() && *address % 4u == 0u && count <= words.size();
+        if (readable && readWords != 0u) {
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(*address)), readWords * 4u)) {
+                GuestMemory::Read(*address, std::as_writable_bytes(std::span(words).first(readWords)));
+            } else {
+                unmapped = address;
+            }
+        }
+        if (!readable) {
+            why += (why.empty() ? "" : "; ") + std::string("the scalar load at program counter ") + hexText(instruction.programCounter) + " has a base it cannot follow";
+        }
+        for (std::uint32_t index = 0; index < count && first + index < sgpr.size(); ++index) {
+            sgpr[first + index] = readable ? std::optional(words[index]) : std::nullopt;
+        }
+    };
+    for (std::size_t index = 0; index < call; ++index) {
+        const auto& instruction = program.instructions[index];
+        if (instruction.programCounter < start) continue;
+        const auto word = instruction.rawWords[0];
+        if (instruction.op == RdnaOpcode::SMovB32 || instruction.op == RdnaOpcode::SMovB64) {
+            const auto destination = (word >> 16u) & 0x7fu;
+            const auto from = word & 0xffu;
+            const bool wide = instruction.op == RdnaOpcode::SMovB64;
+            const auto low = source(instruction, from);
+            const auto high = wide ? (from + 1u < sgpr.size() ? source(instruction, from + 1u) : std::nullopt) : std::nullopt;
+            if (destination < sgpr.size()) sgpr[destination] = low;
+            if (wide && destination + 1u < sgpr.size()) sgpr[destination + 1u] = high;
+            continue;
+        }
+        const bool scalarLoad = instruction.op == RdnaOpcode::SLoadDword || instruction.op == RdnaOpcode::SLoadDwordx2 || instruction.op == RdnaOpcode::SLoadDwordx4 ||
+            instruction.op == RdnaOpcode::SLoadDwordx8 || instruction.op == RdnaOpcode::SLoadDwordx16;
+        const bool bufferLoad = instruction.op == RdnaOpcode::SBufferLoadDword || instruction.op == RdnaOpcode::SBufferLoadDwordx2 || instruction.op == RdnaOpcode::SBufferLoadDwordx4 ||
+            instruction.op == RdnaOpcode::SBufferLoadDwordx8 || instruction.op == RdnaOpcode::SBufferLoadDwordx16;
+        if (scalarLoad || bufferLoad) {
+            const auto base = (word & 0x3fu) * 2u;
+            const auto destination = (word >> 6u) & 0x7fu;
+            const auto count = instruction.dataDwordCount;
+            const auto offset = static_cast<std::int64_t>(static_cast<std::int32_t>(instruction.memoryOffset));
+            const bool noOffsetRegister = ((instruction.rawWords[1] >> 25u) & 0x7fu) == 0x7du;
+            std::optional<std::uint64_t> address;
+            std::uint32_t validWords = count;
+            if (noOffsetRegister && base + (scalarLoad ? 1u : 3u) < sgpr.size() && sgpr[base] && sgpr[base + 1u] && (scalarLoad || sgpr[base + 2u])) {
+                const auto start48 = *sgpr[base] | (static_cast<std::uint64_t>(*sgpr[base + 1u] & 0xffffu) << 32u);
+                address = start48 + static_cast<std::uint64_t>(offset);
+                if (bufferLoad) {
+                    // Scalar buffer loads return zero for dwords past the descriptor's byte range.
+                    const auto stride = (*sgpr[base + 1u] >> 16u) & 0x3fffu;
+                    const auto range = static_cast<std::uint64_t>(*sgpr[base + 2u]) * (stride == 0u ? 1u : stride);
+                    const auto first = static_cast<std::uint64_t>(std::max<std::int64_t>(offset, 0));
+                    validWords = offset < 0 || first >= range ? 0u : static_cast<std::uint32_t>(std::min<std::uint64_t>(count, (range - first) / 4u));
+                }
+            }
+            load(instruction, address, destination, count, validWords);
+            continue;
+        }
+        forget(instruction.destination, 2u);
+        forget(instruction.destination2, 2u);
+    }
+    const auto target = program.instructions[call].rawWords[0] & 0xffu;
+    if (target + 1u >= sgpr.size() || !sgpr[target] || !sgpr[target + 1u]) {
+        why = "s[" + std::to_string(target) + ":" + std::to_string(target + 1u) + "] is not produced by loads and moves after " + hexText(start) + (why.empty() ? "" : "; " + why);
+        return std::nullopt;
+    }
+    return *sgpr[target] | static_cast<std::uint64_t>(*sgpr[target + 1u]) << 32u;
+}
+
 std::vector<std::uint32_t> LinkUserDataCallees(const ShaderRecompiler::RecompileRequest& request) {
     if (request.shader.stage != ShaderRecompiler::ShaderStage::Compute) return {};
     const auto code = request.shader.code;
     if (std::none_of(code.begin(), code.end(), [](std::uint32_t word) { return (word & 0xff80ff00u) == 0xbe802100u; })) return {};
     const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
     const ShaderRecompiler::SwappcInfo swappc{false, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size())};
-    const auto calls = ShaderRecompiler::FindUserDataCalls(program, swappc);
-    if (calls.empty()) return {};
-    std::vector<std::vector<std::uint32_t>> callees;
+    auto calls = ShaderRecompiler::FindUserDataCalls(program, swappc);
+    std::vector<std::uint64_t> addresses;
     for (const auto& call : calls) {
         const auto slot = call.userDataRegister - swappc.userDataBaseRegister;
-        const auto address = static_cast<std::uint64_t>(request.context.userData[slot]) | static_cast<std::uint64_t>(request.context.userData[slot + 1u]) << 32u;
+        addresses.push_back(static_cast<std::uint64_t>(request.context.userData[slot]) | static_cast<std::uint64_t>(request.context.userData[slot + 1u]) << 32u);
+    }
+    const auto userDataCalls = calls.size();
+    // A null target loaded from memory means the wave never reaches the call: its guard tests the
+    // pointer first, and jumping to address zero would fault on the GPU.
+    std::vector<std::uint32_t> skipped;
+    for (std::size_t index = 0; index < program.instructions.size(); ++index) {
+        const auto& instruction = program.instructions[index];
+        if (instruction.op != ShaderRecompiler::RdnaOpcode::SSwappcB64 || instruction.wordCount != 1u) continue;
+        if (std::ranges::any_of(calls, [&](const auto& call) { return call.programCounter == instruction.programCounter; })) continue;
+        std::string why;
+        std::optional<std::uint64_t> unmapped;
+        const auto target = MemoryCallTarget(program, index, why, unmapped);
+        if (!target.has_value()) {
+            APS5_LOG_ERR("compute shader 0x%llx: the target of s_swappc_b64 at program counter 0x%x is not evaluated before the call: %s",
+                static_cast<unsigned long long>(request.shader.codeAddress), instruction.programCounter, why.c_str());
+            continue;
+        }
+        if (unmapped.has_value()) {
+            static std::mutex reportedMutex;
+            static std::set<std::uint64_t> reported;
+            std::lock_guard lock(reportedMutex);
+            if (reported.insert(request.shader.codeAddress).second) {
+                APS5_LOG_ERR("compute shader 0x%llx: s_swappc_b64 at program counter 0x%x loads its target through unmapped guest memory at %s, read as zero (no hook installed); target %s",
+                    static_cast<unsigned long long>(request.shader.codeAddress), instruction.programCounter, hexText(*unmapped).c_str(), hexText(*target).c_str());
+            }
+        }
+        if (*target == 0u) {
+            skipped.push_back(instruction.programCounter);
+            continue;
+        }
+        calls.push_back({instruction.programCounter, (instruction.rawWords[0] >> 16u) & 0x7fu, 0u});
+        addresses.push_back(*target);
+    }
+    if (calls.empty() && skipped.empty()) return {};
+    std::vector<std::vector<std::uint32_t>> callees;
+    for (std::size_t call = 0; call < calls.size(); ++call) {
         try {
-            callees.push_back(ReadUserDataCallee(address, call.linkRegister));
+            callees.push_back(ReadUserDataCallee(addresses[call], calls[call].linkRegister));
         } catch (const std::exception& error) {
-            throw std::runtime_error("AGC driver: compute shader " + hexText(request.shader.codeAddress) + " calls user data s[" + std::to_string(call.userDataRegister) + ":" +
-                std::to_string(call.userDataRegister + 1u) + "] at program counter " + hexText(call.programCounter) + ", but " + error.what());
+            const auto what = call < userDataCalls ? "user data s[" + std::to_string(calls[call].userDataRegister) + ":" + std::to_string(calls[call].userDataRegister + 1u) + "]"
+                                                   : "a target loaded from memory (" + hexText(addresses[call]) + ")";
+            throw std::runtime_error("AGC driver: compute shader " + hexText(request.shader.codeAddress) + " calls " + what + " at program counter " + hexText(calls[call].programCounter) + ", but " + error.what());
         }
     }
-    return ShaderRecompiler::LinkUserDataCalls(program, calls, callees);
+    auto linked = calls.empty() ? std::vector<std::uint32_t>(code.begin(), code.end()) : ShaderRecompiler::LinkUserDataCalls(program, calls, callees);
+    for (const auto counter : skipped) linked[counter / 4u] = 0xbf800000u;
+    return linked;
 }
 
 }
@@ -650,8 +782,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     std::uint32_t resourceRegister;
     std::uint32_t firstUser = 0;
     Stage stage;
-    try {
-        switch (snapshot.type) {
+    switch (snapshot.type) {
     case 0: stage = Stage::Compute; programRegister = 0x20c; resourceRegister = 0x213; break;
     case 1: stage = Stage::Fragment; programRegister = 0x008; resourceRegister = 0x00b; break;
     case 2: stage = Stage::Vertex; programRegister = 0x0c8; resourceRegister = 0x08b; firstUser = 8; break;
@@ -781,16 +912,17 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         append();
     }
     return entries;
+}
+
+std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
+    try {
+        const auto plan = PlanRegistered(snapshot, device, state, registration, deferred);
+        return plan != nullptr ? PrepareRegistered(*plan) : std::vector<PreparedShaders::Entry>{};
     } catch (const std::exception& error) {
         char context[96];
         std::snprintf(context, sizeof(context), " (preparing registered shader 0x%llx type %u)", static_cast<unsigned long long>(snapshot.codeAddress), snapshot.type);
         throw std::runtime_error(error.what() + std::string(context));
     }
-}
-
-std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
-    const auto plan = PlanRegistered(snapshot, device, state, registration, deferred);
-    return plan != nullptr ? PrepareRegistered(*plan) : std::vector<PreparedShaders::Entry>{};
 }
 
 class RegistrationPreparePool {

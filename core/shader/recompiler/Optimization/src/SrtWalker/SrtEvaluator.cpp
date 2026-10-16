@@ -158,6 +158,14 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         result = 0;
         return true;
     }
+    // A root the code spells as an immediate address names a table the system maps, such as a hook
+    // table. When the emulator leaves it unmapped it reads as zero, an empty table, like a null root.
+    const bool fixedRoot = handle->Argument(0)->Resolve()->HasImmediate() && handle->Argument(1)->Resolve()->HasImmediate();
+    if (fixedRoot && base != 0 && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t))) {
+        if (_nullRoots != nullptr) ++*_nullRoots;
+        result = 0;
+        return true;
+    }
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle)) {
         *_inaccessible = {&inst, address};
         return false;
@@ -169,14 +177,7 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
     std::uint32_t word = 0;
     if (_runtime.readMemory != nullptr) {
         if (!_runtime.readMemory(_runtime.userContext, address, &word)) {
-            // The hardware answers scalar loads through null or unmapped addresses with zero; the
-            // shader's own comparisons and fallback paths (an optional pointer with a direct buffer
-            // read) then specialize on that. Descriptor-bounded reads keep failing instead so the
-            // dynamic path covers an unreadable buffer.
-            if (inst.Opcode() != IrOpcode::LoadAddressU32) {
-                return false;
-            }
-            word = 0;
+            return false;
         }
     } else {
         std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));

@@ -227,10 +227,13 @@ function(add_shader_recompiler target runtimeTarget)
             DepthBitsTextureWidth
             FuseExternalCalls
             HashBytes
+            IsDirectBranchOpcode
             PixelInput
             PixelInputBit
             RayTracingStrict
             RayTracingMiss
+            RdnaOpcode
+            RdnaOperandKind
             ReadWholeFile
             Recompile
             RecompileCacheKey::ContextHash
