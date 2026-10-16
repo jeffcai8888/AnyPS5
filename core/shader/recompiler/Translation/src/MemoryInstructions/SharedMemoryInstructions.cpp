@@ -34,6 +34,7 @@ MemoryInfo sharedMemoryInfoFromInstruction(const RdnaInstruction& inst) {
 bool TranslationContext::dsAtomic(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue) {
     MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
     memory.flushDenormals = sharedFloatFlush(opcode);
+    memory.flushDenormalResults = opcode == IrOpcode::SharedAtomicFAdd32 && (!floatMode.has_value() || ((floatMode->floatMode >> 5u) & 1u) == 0u);
     const IrU32 address = readU32(inst.source0);
     const IrU32 value = readU32(inst.source1);
     IrValue& active = ir.GetExec();
@@ -218,6 +219,7 @@ bool TranslationContext::sharedFloatFlush(IrOpcode opcode) const {
     case IrOpcode::SharedAtomicFMin32:
     case IrOpcode::SharedAtomicFMax32:
     case IrOpcode::SharedAtomicCmpstF32:
+    case IrOpcode::SharedAtomicFAdd32:
         return !floatMode.has_value() || ((floatMode->floatMode >> 4u) & 1u) == 0u;
     case IrOpcode::SharedAtomicFMin64:
     case IrOpcode::SharedAtomicFMax64:
@@ -294,30 +296,20 @@ bool TranslationContext::dsAppendConsume(const RdnaInstruction& inst, IrOpcode o
     return true;
 }
 
-// The counter lives at GDS dword offset0[7:2]; offset1 holds wave_release, wave_done, the shader type,
-// the operation (0 add, 1 swap) and, from GFX10, the dword count minus one. The first active lane's
-// data updates the counter once per wave and every lane receives the value before the update. Waves
-// update it in the order they reach it rather than in launch order, so a compaction keeps its total
-// and gives each wave a disjoint range, but ranges may be assigned in a different wave order.
 bool TranslationContext::dsOrderedCount(const RdnaInstruction& inst) {
-    if (!inst.gds) {
-        throw std::runtime_error("ds_ordered_count at pc " + std::to_string(inst.programCounter) + " does not address GDS");
-    }
-    const std::uint32_t offset1 = (inst.memoryOffset >> 8u) & 0xffu;
-    const std::uint32_t operation = (offset1 >> 4u) & 3u;
-    if (operation > 1u || (offset1 >> 6u) != 0u) {
-        throw std::runtime_error("ds_ordered_count at pc " + std::to_string(inst.programCounter) + ": offset1 " + std::to_string(offset1) + " selects a wrap/sub operation or several dwords, which are not modeled");
-    }
+    const std::uint32_t flags = (inst.memoryOffset >> 8u) & 0xffu;
+    const auto location = "ds_ordered_count at pc " + std::to_string(inst.programCounter);
+    if (!inst.gds) throw std::runtime_error(location + " without GDS is not modeled");
+    if ((flags & 0x10u) != 0u) throw std::runtime_error(location + ": ordered swap is not modeled");
+    if (((flags >> 6u) & 3u) != 0u) throw std::runtime_error(location + ": counting more than one dword is not modeled");
     MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
-    memory.offset = inst.memoryOffset & 0xfcu;
-    IrValue& exec = ir.GetExec();
-    const IrU32 data(ir.Emit(IrOpcode::ReadFirstLane, IrType::U32, {&readU32(inst.source0).Value(), &exec}));
-    IrValue& lane = ir.Emit(IrOpcode::LaneId, IrType::U32, {});
-    IrValue& firstLane = ir.Emit(IrOpcode::ReadFirstLane, IrType::U32, {&lane, &exec});
-    IrValue& leader = ir.LogicalAnd(exec, ir.IEqual(lane, firstLane));
-    const IrOpcode opcode = operation == 0u ? IrOpcode::SharedAtomicIAdd32 : IrOpcode::SharedAtomicSwap32;
-    IrValue& old = ir.Emit(opcode, IrOpcodeType(opcode), {&ir.Constant(0u), &data.Value(), &leader}, addMemoryInfo(memory, inst.programCounter));
-    IrValue& result = ir.Emit(IrOpcode::ReadFirstLane, IrType::U32, {&old, &exec});
+    memory.offset = inst.memoryOffset & 0xffu;
+    IrValue& address = ir.Constant(0u);
+    const IrU32 amount = readU32(inst.source0);
+    IrValue& active = ir.GetExec();
+    IrValue& activeLo = ir.GetExecLo();
+    IrValue& activeHi = ir.GetExecHi();
+    IrValue& result = ir.Emit(IrOpcode::DataOrderedCount, IrOpcodeType(IrOpcode::DataOrderedCount), {&address, &active, &activeLo, &activeHi, &amount.Value()}, addMemoryInfo(memory, inst.programCounter));
     writeOperand(inst.destination, &result);
     return true;
 }

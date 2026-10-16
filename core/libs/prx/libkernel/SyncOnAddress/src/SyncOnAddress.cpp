@@ -71,13 +71,27 @@ bool IsAlignedAddress(std::uintptr_t address) {
     return address != 0 && address % alignof(TValue) == 0;
 }
 
+template <class TFunction>
+void DeferringDelivery(TFunction function) {
+#ifdef _WIN32
+    {
+        TimedWait::DeliveryDeferral deferral;
+        function();
+    }
+    TimedWait::DeliverDeferred();
+#else
+    function();
+#endif
+}
+
 template <class TValue>
-bool WaitOnAddressUntil(TValue* address, TValue expected, std::optional<std::uint64_t> deadlineNanos, const void* caller) {
+std::optional<std::chrono::nanoseconds> WaitOnAddressLocked(TValue* address, TValue expected, std::optional<std::uint64_t> deadlineNanos, bool& woken) {
     const auto key = reinterpret_cast<std::uintptr_t>(address);
     Shard& shard = ShardOf(address);
     std::unique_lock<std::mutex> lock(shard.mutex);
     if (std::atomic_ref<TValue>(*address).load() != expected) {
-        return true;
+        woken = true;
+        return std::nullopt;
     }
 
     AddressWaiter waiter;
@@ -92,15 +106,24 @@ bool WaitOnAddressUntil(TValue* address, TValue expected, std::optional<std::uin
     }
     const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart);
 
-    const bool woken = waiter.woken;
+    woken = waiter.woken;
     if (!woken) {
         queue.erase(position);
         if (queue.empty()) {
             shard.waiters.erase(key);
         }
     }
-    lock.unlock();
-    KernelTraceWait_nid_postfix("addr", caller, static_cast<std::uint64_t>(waited.count()), !woken);
+    return waited;
+}
+
+template <class TValue>
+bool WaitOnAddressUntil(TValue* address, TValue expected, std::optional<std::uint64_t> deadlineNanos, const void* caller) {
+    bool woken = false;
+    std::optional<std::chrono::nanoseconds> waited;
+    DeferringDelivery([&] { waited = WaitOnAddressLocked(address, expected, deadlineNanos, woken); });
+    if (waited) {
+        KernelTraceWait_nid_postfix("addr", caller, static_cast<std::uint64_t>(waited->count()), !woken);
+    }
     return woken;
 }
 
@@ -110,7 +133,7 @@ int WaitOnAddress(TValue* address, TValue expected, const KernelUseconds* timeou
     return WaitOnAddressUntil(address, expected, deadline, caller) ? SYNC_ON_ADDRESS_OK : SCE_KERNEL_ERROR_ETIMEDOUT;
 }
 
-void WakeAddress(std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
+void WakeAddressLocked(std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
     Shard& shard = ShardOf(reinterpret_cast<const void*>(key));
     std::lock_guard<std::mutex> lock(shard.mutex);
     const auto entry = shard.waiters.find(key);
@@ -127,6 +150,10 @@ void WakeAddress(std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
     if (queue.empty()) {
         shard.waiters.erase(entry);
     }
+}
+
+void WakeAddress(std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
+    DeferringDelivery([&] { WakeAddressLocked(key, count, wakesAtLeastOne); });
 }
 
 std::uint64_t SaturatingNanos(std::int64_t seconds, std::int64_t nanos) {

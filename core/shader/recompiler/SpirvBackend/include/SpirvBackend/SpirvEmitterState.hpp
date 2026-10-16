@@ -73,17 +73,28 @@ struct MemoryResourceAccess {
     std::uint32_t misalignment = 0;
 };
 
+struct SpirvTableImageVariable {
+    DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
+    std::uint32_t variable = 0;
+};
+
+struct SpirvTableAccess {
+    std::uint32_t element = 0;
+    std::uint32_t dword3 = 0;
+    std::uint32_t samplerElement = 0;
+    bool active = false;
+};
+
 struct SpirvEmitterState {
     const ImageResource* runtimeImage = nullptr;
-    std::uint32_t runtimeImageMetadata = 0u;
+    SpirvTableAccess tableAccess;
     SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo);
 
     SpirvModule module;
     const IrProgram& program;
     ShaderStageInputInfo inputInfo;
-    std::array<std::uint32_t, 6> tessVariables {};
+    std::array<std::uint32_t, 9> tessVariables {};
     std::uint32_t tessInnerVariable = 0;
-    std::uint32_t tessPatchBase = 0;
 
     SpirvRequirements requirements;
     std::uint32_t laneCount = 1;
@@ -93,23 +104,22 @@ struct SpirvEmitterState {
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
+    bool float16DenormPreserve = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
-    // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds
-    // only when needed (bindless image tables: see TableImageIndex).
     std::uint32_t spirvVersion = 0x00010300u;
     std::span<const std::uint32_t> supportedCapabilities;
     std::span<const std::string_view> supportedExtensions;
     bool nonConstantImageOffsets = false;
-    // A bindless table's runtime slot is wave-uniform; it is uniform over the invocation group
-    // only for a single-wave compute workgroup, elsewhere it needs the NonUniform decoration.
     bool tableIndexNonUniform = true;
     std::uint32_t storageBufferVariable = 0;
     std::uint32_t storageBufferU64Variable = 0;
     std::uint32_t storageBufferCoherentVariable = 0;
+    std::uint32_t storageBufferU8Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
+    std::uint32_t bufferFormatTable = 0;
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
@@ -123,9 +133,12 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 2> bdaByteWriteFunctions {};
     std::uint32_t bdaFaultFunction = 0;
     bool nativeF16ModesEmitted = false;
+    bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;
+    std::map<std::pair<bool, std::uint32_t>, std::uint32_t> interpolateFunctions;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
+    std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> bdaGroupedLoads;
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
@@ -151,8 +164,13 @@ struct SpirvEmitterState {
     std::uint32_t numWorkgroupsVariable = 0;
     std::array<std::uint32_t, 2> scratchVariable {};
     std::array<std::uint32_t, 2> vectorWindowVariable {};
+    std::uint32_t vectorWindowIndexed = 0;
+    std::array<std::vector<std::uint32_t>, 2> vectorWindowSlots {};
     std::array<std::uint32_t, ImageBindingCount> imageVariables {};
     std::uint32_t samplerVariable = 0;
+    std::vector<SpirvTableImageVariable> tableImageVariables;
+    std::uint32_t tableSamplerVariable = 0;
+    std::uint32_t tableMapVariable = 0;
     std::uint32_t mainFunc = 0;
     std::uint32_t meshGuestFunc = 0;
     std::uint32_t meshAllocation = 0;
@@ -163,6 +181,9 @@ struct SpirvEmitterState {
     std::uint32_t currentLabel = 0;
     const IrBlock* currentBlock = nullptr;
     std::uint32_t pixelValidMaskVariable = 0;
+    std::uint32_t quadPixelUncovered = 0;
+    std::uint32_t sampleMaskInputVariable = 0;
+    std::uint32_t quadSampleCoverage = 0;
     std::uint32_t subgroupLocalInvocationIdVariable = 0;
     std::uint32_t perVertexVariable = 0;
     std::uint32_t pointSizeVariable = 0;
@@ -174,6 +195,7 @@ struct SpirvEmitterState {
     std::uint32_t depthVariable = 0;
     std::uint32_t sampleMaskVariable = 0;
     std::uint32_t stencilRefVariable = 0;
+    bool stencilReplay = false;
     std::vector<SpirvInputBinding> inputs;
     std::vector<SpirvOutputBinding> outputs;
     std::vector<std::uint32_t> interfaceVariables;

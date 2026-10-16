@@ -63,7 +63,7 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
-    bool hostFallback = false;
+    bool hostPlaced = false;
 };
 
 // Records a whole-range buffer copy.

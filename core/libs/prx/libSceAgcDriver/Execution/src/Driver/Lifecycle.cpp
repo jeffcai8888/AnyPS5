@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -10,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <system_error>
 #include <thread>
 #ifdef _WIN32
@@ -28,6 +30,18 @@ namespace {
 constexpr std::uintptr_t InlineImportStackBytes = 256 * 1024;
 
 std::atomic<std::uint64_t> gpuMapImportThreads{0};
+
+void PrintFailure(std::exception_ptr error) {
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& cause) {
+        std::fprintf(stderr, "[gpu] driver failure: %s\n", cause.what());
+    } catch (...) {
+        std::fprintf(stderr, "[gpu] driver failure with a non-standard exception\n");
+    }
+    FlushAsyncLog_nid_no_patch();
+    std::fflush(stderr);
+}
 
 bool StackHoldsImport() {
 #ifdef _WIN32
@@ -89,6 +103,7 @@ void Driver::stop() {
     {
         std::lock_guard lock(mutex);
         stopping = true;
+        eopFlips.clear();
         for (auto& [queue, worker] : workers) {
             worker.pending.clear();
             worker.unfinishedWrites.clear();
@@ -106,11 +121,13 @@ void Driver::stop() {
     replacedDevices.clear();
     Graphics::ShutdownGuestBufferWorkers();
     PerformanceTrace::StopOutput();
+    FlushAsyncLog_nid_no_patch();
     StopProfileOutput_nid_no_patch();
     stopped = true;
 }
 
 Driver::Driver() {
+    InstallAsyncLog_nid_no_patch();
     static_cast<void>(GuestMemory::TrackerGeneration());
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {
@@ -167,9 +184,11 @@ void Driver::CheckFailure() {
 
 void Driver::ReportFailure(std::exception_ptr error) {
     require(error != nullptr, "null asynchronous failure");
+    bool first = false;
     {
         std::lock_guard lock(mutex);
-        if (!failure) failure = error;
+        first = !failure;
+        if (first) failure = error;
         failed.store(true, std::memory_order_release);
         for (const auto& [handle, output] : outputs) output->Fail(failure);
         for (auto& [queue, worker] : workers) {
@@ -180,6 +199,7 @@ void Driver::ReportFailure(std::exception_ptr error) {
             worker.unfinishedWrites.clear();
             worker.queued.store(0, std::memory_order_release);
         }
+        if (first) PrintFailure(error);
     }
     changed.notify_all();
 }

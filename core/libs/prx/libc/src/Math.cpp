@@ -1,5 +1,6 @@
 #include <mutex>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cerrno>
 #include <cfenv>
@@ -9,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <xmmintrin.h>
 
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/SonyCrt.hpp"
@@ -18,7 +20,7 @@ namespace {
 template<typename TFloat>
 std::int64_t RoundToInt64(TFloat value) {
     const TFloat rounded = std::round(value);
-    if (!(rounded >= static_cast<TFloat>(INT64_MIN) && rounded < static_cast<TFloat>(INT64_MAX))) {
+    if (!(rounded >= static_cast<TFloat>(INT64_MIN) && rounded < -static_cast<TFloat>(INT64_MIN))) {
         std::feraiseexcept(FE_INVALID);
         return INT64_MIN;
     }
@@ -182,7 +184,18 @@ float APS5_VABI asinf_nid_postfix(float x) {
     errno = saved_errno;
     return result;
 }
-float APS5_VABI acosf_nid_postfix(float x) { return std::acos(x); }
+float APS5_VABI acosf_nid_postfix(float x) {
+    if (std::isnan(x)) {
+        return std::bit_cast<float>(std::bit_cast<std::uint32_t>(x) | 0x00400000u);
+    }
+    if (std::fabs(x) > 1.0f) {
+        return std::bit_cast<float>(0xffc00000u);
+    }
+    const int saved_errno = errno;
+    const float result = std::acos(x);
+    errno = saved_errno;
+    return result;
+}
 float APS5_VABI atan2f_nid_postfix(float y, float x) { return std::atan2(y, x); }
 float APS5_VABI hypotf_nid_postfix(float x, float y) { return static_cast<float>(std::hypot(static_cast<double>(x), static_cast<double>(y))); }
 double APS5_VABI hypot_nid_postfix(double x, double y) {
@@ -239,6 +252,9 @@ int APS5_VABI abs_nid_postfix(int x) { return x < 0 ? static_cast<int>(0u - stat
 double APS5_VABI trunc_nid_postfix(double x) { return std::trunc(x); }
 double APS5_VABI ceil_nid_postfix(double x) { return std::ceil(x); }
 double APS5_VABI floor_nid_postfix(double x) { return std::floor(x); }
+float APS5_VABI truncf_nid_postfix(float x) { return std::trunc(x); }
+float APS5_VABI ceilf_nid_postfix(float x) { return std::ceil(x); }
+float APS5_VABI floorf_nid_postfix(float x) { return std::floor(x); }
 double APS5_VABI fma_nid_postfix(double x, double y, double z) { return std::fma(x, y, z); }
 long double APS5_VABI acosl_nid_postfix(long double x) { return std::acos(x); }
 
@@ -286,7 +302,11 @@ float APS5_VABI log1pf_nid_postfix(float x) { return std::log1p(x); }
 double APS5_VABI expm1_nid_postfix(double x) { return std::expm1(x); }
 float APS5_VABI expm1f_nid_postfix(float x) { return std::expm1(x); }
 float APS5_VABI erff_nid_postfix(float x) { return std::erf(x); }
-double APS5_VABI lgamma_nid_postfix(double x) { return std::lgamma(x); }
+double APS5_VABI lgamma_nid_postfix(double x) {
+    const std::uint64_t magnitude = std::bit_cast<std::uint64_t>(x) & 0x7fffffffffffffffull;
+    if (magnitude != 0 && magnitude < 0x3c70000000000000ull) return -std::log(std::fabs(x));
+    return std::lgamma(x);
+}
 
 float APS5_VABI sinf_nid_postfix(float x) { return std::sin(x); }
 float APS5_VABI cosf_nid_postfix(float x) { return std::cos(x); }
@@ -371,6 +391,18 @@ float APS5_VABI __powisf2_nid_postfix(float base, int exponent) {
     }
     return reciprocal ? 1.0f / result : result;
 }
+double APS5_VABI __powidf2_nid_postfix(double base, int exponent) {
+    const bool reciprocal = exponent < 0;
+    double result = 1.0;
+    unsigned int magnitude = reciprocal ? 0u - static_cast<unsigned int>(exponent) : static_cast<unsigned int>(exponent);
+    while (magnitude != 0u) {
+        if ((magnitude & 1u) != 0u) result *= base;
+        magnitude >>= 1u;
+        if (magnitude == 0u) break;
+        base *= base;
+    }
+    return reciprocal ? 1.0 / result : result;
+}
 float APS5_VABI expf_nid_postfix(float x) { return std::exp(x); }
 float APS5_VABI exp2f_nid_postfix(float x) { return std::exp2(x); }
 float APS5_VABI logf_nid_postfix(float x) { return std::log(x); }
@@ -439,8 +471,23 @@ short APS5_VABI _FDtest_nid_postfix(const float* value) {
     if (exponent == 0) return fraction != 0 ? Denormal : Zero;
     return Finite;
 }
+
+short APS5_VABI _Dtest_nid_postfix(const double* value) {
+    constexpr short Denormal = -2, Finite = -1, Zero = 0, Infinite = 1, NotANumber = 2;
+    if (value == nullptr) throw std::invalid_argument("_Dtest: null value");
+    std::uint64_t bits;
+    std::memcpy(&bits, value, sizeof(bits));
+    const auto exponent = bits & 0x7ff0000000000000u;
+    const auto fraction = bits & 0x000fffffffffffffu;
+    if (exponent == 0x7ff0000000000000u) return fraction != 0 ? NotANumber : Infinite;
+    if (exponent == 0) return fraction != 0 ? Denormal : Zero;
+    return Finite;
+}
+
 int APS5_VABI __isnanf_nid_postfix(float x) { return std::isnan(x) ? 1 : 0; }
 int APS5_VABI isnanf_nid_postfix(float x) { return __isnanf_nid_postfix(x); }
+int APS5_VABI isnan_nid_postfix(double x) { return __isnan_nid_postfix(x); }
+int APS5_VABI isinf_nid_postfix(double x) { return __isinf_nid_postfix(x); }
 int APS5_VABI __fpclassifyf_nid_postfix(float x) {
     constexpr int Infinite = 0x01, NotANumber = 0x02, Normal = 0x04, Subnormal = 0x08, Zero = 0x10;
     std::uint32_t bits;
@@ -455,6 +502,13 @@ int APS5_VABI __signbitf_nid_postfix(float x) { return std::signbit(x) ? 1 : 0; 
 int APS5_VABI __signbitl_nid_postfix(long double x) {
     static_assert(sizeof(long double) == 16, "guest long double requires x87 extended precision storage");
     return std::signbit(x) ? 1 : 0;
+}
+
+int APS5_VABI __isfinitel_nid_postfix(long double x) {
+    static_assert(sizeof(long double) == 16 && std::numeric_limits<long double>::digits == 64 && std::numeric_limits<long double>::max_exponent == 16384 && std::endian::native == std::endian::little, "guest long double requires little-endian x87 extended precision storage");
+    std::uint16_t exponent;
+    std::memcpy(&exponent, reinterpret_cast<const std::uint8_t*>(&x) + 8, sizeof(exponent));
+    return (exponent & 0x7fffu) != 0x7fffu;
 }
 
 static std::mutex g_randLock;
@@ -498,4 +552,29 @@ int APS5_VABI _Fltrounds_nid_postfix(void) {
     return SonyFltrounds();
 }
 
+struct GuestFloatingPointEnvironment {
+    std::uint32_t control;
+    std::uint32_t status;
+    std::uint32_t tag;
+    unsigned char other[16];
+    std::uint32_t mxcsr;
+};
+static_assert(sizeof(GuestFloatingPointEnvironment) == 32 && offsetof(GuestFloatingPointEnvironment, mxcsr) == 28);
+
+int APS5_VABI fegetenv_nid_postfix(GuestFloatingPointEnvironment* environment) {
+    if (environment == nullptr) throw std::invalid_argument("fegetenv: null environment");
+    asm volatile("fnstenv %0\n\tfldcw %0" : "+m"(*environment));
+    environment->mxcsr = _mm_getcsr();
+    return 0;
+}
+
+union SonyDconst {
+    unsigned short _Word[8];
+    float _Float;
+    double _Double;
+    long double _Long_double;
+};
+
+static_assert(std::endian::native == std::endian::little);
+SonyDconst _Inf_nid_postfix {{0, 0, 0, 0x7ff0, 0, 0, 0, 0}};
 }

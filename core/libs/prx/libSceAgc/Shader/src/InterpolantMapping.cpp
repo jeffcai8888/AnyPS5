@@ -83,7 +83,7 @@ int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader*
         throw std::runtime_error(std::string(fn) + ": input semantic count exceeds 32");
     }
 
-    AgcDriver::ShaderPreparationScope transaction;
+    AgcDriver::ShaderPreparationScope transaction({ps != nullptr ? gs : nullptr, ps});
     std::array<ShaderRegister, 32> values{};
     auto* output = regs;
     regs = values.data();
@@ -148,6 +148,18 @@ int APS5_VABI sceAgcUnknownCreateInterpolantMapping(ShaderRegister* regs, const 
 APS5_EXPORT("vieBRwlh1Lw", sceAgcUnknown_vieBRwlh1Lw);
 int APS5_VABI sceAgcUnknown_vieBRwlh1Lw(ShaderRegister* regs, const Shader* gs, const Shader* ps) {
     TraceAgcCall(__func__, gs, ps);
+    return CreateInterpolantMapping(__func__, regs, gs, ps, UpdateInterpolantValue, false);
+}
+
+int APS5_VABI sceAgcCreateInterpolantMapping_10000(ShaderRegister* regs, const Shader* gs, const Shader* ps) {
+    TraceAgcCall(__func__, gs, ps);
+    return CreateInterpolantMapping(__func__, regs, gs, ps, CreateInterpolantValueSplitF16, true);
+}
+
+int APS5_VABI sceAgcUpdateInterpolantMapping_10000(ShaderRegister* regs, const Shader* gs, const Shader* ps) {
+    TraceAgcCall(__func__, gs, ps);
+    return CreateInterpolantMapping(__func__, regs, gs, ps, UpdateInterpolantValue, false);
+}
     return CreateInterpolantMapping(__func__, regs, gs, ps, UpdateInterpolantValue, false);
 }
 

@@ -17,6 +17,7 @@
 #include <span>
 #include <utility>
 #include <vector>
+#include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -28,10 +29,11 @@ struct DispatchVariant {
     std::vector<std::uint32_t> words;
     std::uint64_t forgetSerial = 0;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::array<std::uint32_t, 4> meshIndexDescriptor{};
 
     std::shared_ptr<const ShaderSnapshot> shader;
 
-    std::atomic<std::shared_ptr<const Recipe>> recipe;
+    AtomicSharedPtr<const Recipe> recipe;
 
     static constexpr std::uint32_t NoFlatBinding = std::numeric_limits<std::uint32_t>::max();
     std::vector<std::uint32_t> dataPositions;

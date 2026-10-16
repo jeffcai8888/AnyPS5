@@ -18,7 +18,10 @@ struct ConversionOptions {
     bool TrapSdkSyscallStubs = false;
     bool LazyBinding = false;
     bool WindowsGui = false;
+    bool TraceImports = false;
+    std::optional<std::uint64_t> WindowsFixedBase;
     bool WindowsDiagnostics = false;
+    std::optional<std::uint64_t> LinuxFixedBase;
     std::string RunPath = "$ORIGIN/libs";
     std::set<std::string> ExcludedModules;
 };

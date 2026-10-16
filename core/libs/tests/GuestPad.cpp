@@ -250,6 +250,21 @@ int main() {
 #else
     Require(setenv("APS5_PAD_INPUT_FILE", path.string().c_str(), 1) == 0);
 #endif
+    {
+        std::uint32_t sequence = 0;
+        PadOutputState snapshot;
+        Pad::SetVibration(12, 34);
+        PadSubmitAudioHaptics_nid_postfix(100, 150);
+        Require(PadFetchOutput_nid_postfix(&sequence, &snapshot));
+        Require(snapshot.audioVibrationLarge == 100 && snapshot.audioVibrationSmall == 150);
+        Require(snapshot.vibrationLarge == 12 && snapshot.vibrationSmall == 34);
+        PadSubmitAudioHaptics_nid_postfix(0, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        Require(PadFetchOutput_nid_postfix(&sequence, &snapshot));
+        Require(snapshot.audioVibrationLarge == 0 && snapshot.audioVibrationSmall == 0);
+        Require(snapshot.vibrationLarge == 12 && snapshot.vibrationSmall == 34);
+        Pad::SetVibration(0, 0);
+    }
     constexpr int noHandle = static_cast<int>(0x80920008);
     constexpr int user = 0x10000000;
 
@@ -282,6 +297,8 @@ int main() {
     Require(scePadSetVibrationMode(handle, 2) == 0);
     Require(scePadSetVibrationMode(handle, 3) == 0);
     Require(scePadSetVibrationMode(handle, 4) == PAD_ERROR_INVALID_ARG);
+    Require(scePadSetVibrationMode(handle, 5) == 0);
+    Require(scePadSetVibrationMode(handle, 6) == PAD_ERROR_INVALID_ARG);
     Require(scePadSetVibrationMode(handle, -1) == PAD_ERROR_INVALID_ARG);
     Require(scePadGetHandle(0xff, 16, 0) == handle);
     Require(scePadGetHandle(user, 16, 0) == noHandle);

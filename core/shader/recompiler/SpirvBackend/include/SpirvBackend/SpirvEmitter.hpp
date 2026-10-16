@@ -23,6 +23,7 @@ struct SpirvTargetOptions {
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
+    bool float16DenormPreserve = false;
 };
 
 class SpirvEmitter {

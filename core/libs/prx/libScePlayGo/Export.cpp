@@ -3,10 +3,12 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <regex>
 #include <set>
+#include <stdexcept>
 #include <string>
 
 // The game is fully installed on the host, so every chunk is local and nothing is pending.
@@ -17,6 +19,7 @@ static constexpr int8_t PLAYGO_LOCUS_NOT_DOWNLOADED = 0;
 static constexpr int8_t PLAYGO_LOCUS_LOCAL_SLOW = 2;
 static constexpr int8_t PLAYGO_LOCUS_LOCAL_FAST = 3;
 static constexpr uint64_t PLAYGO_LANGUAGE_MASK_ALL = ~0ull;
+static constexpr uint64_t PLAYGO_OPTIONAL_CHUNK_MASK_ALL = ~0ull;
 static constexpr int32_t PLAYGO_INSTALL_SPEED_FULL = 2;
 
 static int32_t g_installSpeed = PLAYGO_INSTALL_SPEED_FULL;
@@ -28,19 +31,32 @@ static constexpr int SCE_PLAYGO_ERROR_BAD_LOCUS = static_cast<int>(0x80B20010);
 struct ChunkTable {
     std::set<uint16_t> ids{0};
     bool defined = false;
+    bool scenario = false;
 };
 
 static bool ReadPackageChunks(ChunkTable& table) {
     constexpr std::size_t CountOffset = 0x0A;
     std::ifstream file(ResolvePath_nid_no_patch("/app0/sce_sys/playgo-chunk.dat"), std::ios::binary);
     char header[CountOffset + sizeof(uint16_t)]{};
-    if (!file.read(header, sizeof(header)) || std::memcmp(header, "plgx", 4) != 0) return false;
+    if (!file) return false;
+    const auto unreadable = [] { return std::runtime_error("scePlayGo: sce_sys/playgo-chunk.dat is not a chunk table this library reads (expected a plgx header with a nonzero chunk count)"); };
+    if (!file.read(header, sizeof(header)) || std::memcmp(header, "plgx", 4) != 0) throw unreadable();
     uint16_t count = 0;
     std::memcpy(&count, header + CountOffset, sizeof(count));
-    if (count == 0) return false;
+    if (count == 0) throw unreadable();
     for (uint32_t id = 0; id < count; ++id) table.ids.insert(static_cast<uint16_t>(id));
     table.defined = true;
     return true;
+}
+
+static void RejectUnreadablePlayGoFiles() {
+    std::error_code error;
+    const std::filesystem::path directory = ResolvePath_nid_no_patch("/app0/sce_sys");
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+        const auto name = entry.path().filename().string();
+        if (name.rfind("playgo-", 0) == 0)
+            throw std::runtime_error("scePlayGo: sce_sys/" + name + " is present but no chunk table (playgo-chunk.dat) or scenario file (playgo-scenario.json) is, so the chunk ids are unknown");
+    }
 }
 
 static const ChunkTable& Chunks() {
@@ -48,7 +64,9 @@ static const ChunkTable& Chunks() {
         ChunkTable table;
         std::ifstream file(ResolvePath_nid_no_patch("/app0/playgo-chunkdefs.xml"));
         if (!file) {
-            ReadPackageChunks(table);
+            if (ReadPackageChunks(table)) return table;
+            table.scenario = std::ifstream(ResolvePath_nid_no_patch("/app0/sce_sys/playgo-scenario.json")).good();
+            if (!table.scenario) RejectUnreadablePlayGoFiles();
             return table;
         }
         table.defined = true;
@@ -70,7 +88,9 @@ static const ChunkTable& Chunks() {
 
 static bool IsKnownChunk(uint16_t id) {
     const auto& chunks = Chunks();
-    return !chunks.defined || chunks.ids.contains(id);
+    if (chunks.defined) return chunks.ids.contains(id);
+    if (chunks.scenario || id == 0) return true;
+    throw std::runtime_error("scePlayGo: sce_sys/playgo-chunk.dat and sce_sys/playgo-scenario.json are missing, so chunk ID " + std::to_string(id) + " cannot be checked");
 }
 
 static int ValidateChunks(const uint16_t* chunk_ids, uint32_t number_of_entries) {
@@ -143,7 +163,7 @@ int APS5_VABI scePlayGoGetOptionalChunk(int handle, int32_t type, PlayGoOptional
     if (handle != PLAYGO_HANDLE) return SCE_PLAYGO_ERROR_BAD_HANDLE;
     (void)type;
     if (!option) return SCE_PLAYGO_ERROR_BAD_POINTER;
-    option->bitmask = 0;
+    option->bitmask = PLAYGO_OPTIONAL_CHUNK_MASK_ALL;
     return 0;
 }
 
@@ -160,7 +180,7 @@ int APS5_VABI scePlayGoGetSupportedOptionalChunk(int handle, int32_t type, PlayG
     if (handle != PLAYGO_HANDLE) return SCE_PLAYGO_ERROR_BAD_HANDLE;
     (void)type;
     if (!option) return SCE_PLAYGO_ERROR_BAD_POINTER;
-    option->bitmask = 0;
+    option->bitmask = PLAYGO_OPTIONAL_CHUNK_MASK_ALL;
     return 0;
 }
 

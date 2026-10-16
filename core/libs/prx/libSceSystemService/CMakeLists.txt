@@ -1,26 +1,57 @@
-add_library(libSceSystemService SHARED EXCLUDE_FROM_ALL Export.cpp)
+add_library(libSceSystemService SHARED EXCLUDE_FROM_ALL Export.cpp LoadExec.cpp)
 target_include_directories(libSceSystemService PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(libSceSystemService PRIVATE libSceAgcDriver)
 configure_windows_unwind(libSceSystemService)
 
 if(BUILD_TESTING)
+    if(WIN32)
+        add_test_executable(guest_system_service_path_boundary_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemServicePathBoundary.cpp)
+        target_include_directories(guest_system_service_path_boundary_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_system_service_path_boundary_tests PRIVATE libSceSystemService libc)
+        configure_windows_unwind(guest_system_service_path_boundary_tests)
+        add_test(NAME guest_system_service_path_boundary COMMAND guest_system_service_path_boundary_tests)
+        set_tests_properties(guest_system_service_path_boundary PROPERTIES TIMEOUT 20)
+        set_tests_properties(guest_system_service_path_boundary PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_library(guest_loadexec_host SHARED ${LIBS_INCLUDE_DIR}/tests/GuestLoadExecHost.cpp)
+    target_include_directories(guest_loadexec_host PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_loadexec_host PRIVATE libSceSystemService libc libkernel)
+    set_target_properties(guest_loadexec_host PROPERTIES PREFIX "" SUFFIX ".prx" BUILD_RPATH "$ORIGIN")
+    configure_windows_unwind(guest_loadexec_host)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+        add_test(NAME loadexec_arguments COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/core/relinker/relinker/tests/test_loadexec_arguments.py
+            $<TARGET_FILE:relinker> $<TARGET_FILE:guest_loadexec_host>
+            $<TARGET_FILE:libSceSystemService> $<TARGET_FILE:libSceAgcDriver> $<TARGET_FILE:libc> $<TARGET_FILE:libkernel> ${CMAKE_CXX_COMPILER})
+        set_tests_properties(loadexec_arguments PROPERTIES TIMEOUT 30)
+    endif()
     add_test_executable(guest_system_exit_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemExit.cpp)
     target_include_directories(guest_system_exit_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_system_exit_tests PRIVATE libSceSystemService libc)
     configure_windows_unwind(guest_system_exit_tests)
     add_test(NAME guest_system_exit_parameters COMMAND guest_system_exit_tests)
     add_test(NAME guest_system_exit COMMAND guest_system_exit_tests --exit)
+    add_test(NAME guest_requested_exit COMMAND guest_system_exit_tests --requested-exit-driver)
     add_test(NAME guest_quick_exit COMMAND guest_system_exit_tests --quick-exit)
     add_test(NAME guest_immediate_exit COMMAND guest_system_exit_tests --immediate)
     add_test(NAME guest_return_from_main COMMAND guest_system_exit_tests --return-from-main)
     add_test(NAME guest_system_relaunch COMMAND guest_system_exit_tests --relaunch-driver)
-    set_tests_properties(guest_system_exit PROPERTIES
-        PASS_REGULAR_EXPRESSION "Guest shutdown and atexit completed")
+    add_test(NAME guest_nested_exit COMMAND guest_system_exit_tests --nested-exit-driver)
+    set_tests_properties(guest_system_exit guest_requested_exit PROPERTIES
+        PASS_REGULAR_EXPRESSION "Guest shutdown completed"
+        FAIL_REGULAR_EXPRESSION "Guest exit handler ran|Guest thread resumed during exit")
+    set_tests_properties(guest_requested_exit PROPERTIES TIMEOUT 10)
     set_tests_properties(guest_quick_exit PROPERTIES
         PASS_REGULAR_EXPRESSION "Guest quick_exit handlers completed")
     set_tests_properties(guest_system_relaunch PROPERTIES
         PASS_REGULAR_EXPRESSION "Guest relaunch completed" TIMEOUT 30)
+    set_tests_properties(guest_nested_exit PROPERTIES
+        PASS_REGULAR_EXPRESSION "Guest nested exit completed" TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(guest_system_exit guest_system_exit_parameters guest_immediate_exit guest_return_from_main guest_quick_exit guest_system_relaunch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_system_exit guest_requested_exit guest_system_exit_parameters guest_immediate_exit guest_return_from_main guest_quick_exit guest_system_relaunch guest_nested_exit PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_system_service_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemService.cpp)

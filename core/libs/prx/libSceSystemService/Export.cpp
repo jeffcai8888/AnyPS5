@@ -18,9 +18,11 @@
 #endif
 #include "prx/libc/include/Shutdown.hpp"
 #include "SceTypes.hpp"
+#include "LoadExec.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 
 namespace {
 
@@ -62,6 +64,12 @@ std::string ConvertedExecutableName(const char* path) {
         name += (name.empty() ? "" : ".") + std::string(component);
         if (separator == std::string_view::npos) return name;
         relative.remove_prefix(separator + 1);
+    }
+}
+
+void RequireExecutableBeside(const std::filesystem::path& directory, const std::filesystem::path& target, const char* guestPath) {
+    if (target.lexically_normal().parent_path() != directory.lexically_normal()) {
+        UnconvertedExecutable(std::string("an executable outside /app0 (") + guestPath + ")");
     }
 }
 
@@ -115,6 +123,7 @@ HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
         launch.executable = mainLength > 0 && mainLength < main.size() ? main.substr(0, mainLength) : own;
     } else {
         const auto target = ownPath.parent_path() / (Utf16(ConvertedExecutableName(path)) + ownPath.extension().wstring());
+        RequireExecutableBeside(ownPath.parent_path(), target, path);
         if (!std::filesystem::is_regular_file(target)) {
             UnconvertedExecutable(std::string(path) + " without its converted executable; relink with --executable " + (path + std::size(ApplicationRoot) - 1));
         }
@@ -156,6 +165,7 @@ HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
         launch.executable = main != nullptr && *main != '\0' ? main : own.string();
     } else {
         const auto target = own.parent_path() / (ConvertedExecutableName(path) + own.extension().string());
+        RequireExecutableBeside(own.parent_path(), target, path);
         if (!std::filesystem::is_regular_file(target)) {
             UnconvertedExecutable(std::string(path) + " without its converted executable; relink with --executable " + (path + std::size(ApplicationRoot) - 1));
         }
@@ -192,8 +202,11 @@ extern "C" {
 
 int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* arguments) {
     if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
-    if (std::strcmp(path, "exit") == 0) LibcExit_nid_no_patch(0);
+    if (std::strcmp(path, "exit") == 0) LibcExitWithoutHandlers_nid_no_patch(0);
     auto launch = PrepareLaunch(path, arguments);
+#if defined(_WIN32) || defined(__linux__)
+    LoadConvertedExecutable_nid_no_patch(std::filesystem::path(launch.executable), arguments);
+#endif
     LibcRunShutdown_nid_postfix();
     std::fflush(nullptr);
     StartHostExecutable(launch);
@@ -217,10 +230,11 @@ int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLumi
  if (luminance == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- constexpr float SdrReferenceWhiteNits = 100.0f;
- luminance->max_full_frame_tone_map_luminance = SdrReferenceWhiteNits;
- luminance->max_tone_map_luminance = SdrReferenceWhiteNits;
- luminance->min_tone_map_luminance = 0.0f;
+ const auto hdr = AgcDriver::CurrentHostHdr();
+ luminance->max_tone_map_luminance = AgcDriver::ToneMapPeakNits(hdr);
+ luminance->max_full_frame_tone_map_luminance = hdr.available ? hdr.display.maxFullFrameLuminance : AgcDriver::SdrToneMapLuminanceNits;
+ luminance->min_tone_map_luminance = hdr.available ? hdr.display.minLuminance : 0.0f;
+ AgcDriverNoteReportedToneMapPeak_nid_postfix(luminance->max_tone_map_luminance);
  return SYSTEM_SERVICE_OK;
 }
 

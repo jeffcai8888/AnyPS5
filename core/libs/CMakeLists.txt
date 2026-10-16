@@ -9,6 +9,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
+if(APPLE)
+    set(ANYPS5_PRX_RPATH "@loader_path")
+else()
+    set(ANYPS5_PRX_RPATH "$ORIGIN")
+endif()
+
 add_executable(nid_patcher
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/Sha1.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/NidCompute.cpp
@@ -25,7 +31,7 @@ target_include_directories(nid_patcher PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/nid/i
 target_compile_features(nid_patcher PRIVATE cxx_std_20)
 
 if(MINGW)
-    target_link_options(nid_patcher PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_options(nid_patcher PRIVATE -municode -static -static-libgcc -static-libstdc++)
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_FLAGS -fno-asynchronous-unwind-tables)
     check_cxx_source_compiles("#ifdef __USING_SJLJ_EXCEPTIONS__\n#error\n#endif\nint main() { return 0; }" ANYPS5_MINGW_DWARF_EXCEPTIONS)
@@ -52,6 +58,21 @@ if(MINGW)
     foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)
         string(REPLACE "${runtimeLinkFlag}" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
     endforeach()
+
+    if(NOT EXISTS "${CMAKE_RANLIB}")
+        message(FATAL_ERROR "Stable import libraries require ranlib")
+    endif()
+    list(LENGTH CMAKE_CXX_CREATE_SHARED_LIBRARY linkCommandCount)
+    string(FIND "${CMAKE_CXX_CREATE_SHARED_LIBRARY}" "-Wl,--out-implib,<TARGET_IMPLIB> " implibOption)
+    if(NOT linkCommandCount EQUAL 1 OR implibOption EQUAL -1)
+        message(FATAL_ERROR "Expected one shared library link command that writes -Wl,--out-implib,<TARGET_IMPLIB>: ${CMAKE_CXX_CREATE_SHARED_LIBRARY}")
+    endif()
+    string(REPLACE "-Wl,--out-implib,<TARGET_IMPLIB> " "-Wl,--out-implib,<TARGET_IMPLIB>.new " linkCommand "${CMAKE_CXX_CREATE_SHARED_LIBRARY}")
+    set(CMAKE_CXX_CREATE_SHARED_LIBRARY
+            "\"${CMAKE_COMMAND}\" -E env SOURCE_DATE_EPOCH=0 ${linkCommand}"
+            "\"${CMAKE_RANLIB}\" -D <TARGET_IMPLIB>.new"
+            "\"${CMAKE_COMMAND}\" -E copy_if_different <TARGET_IMPLIB>.new <TARGET_IMPLIB>"
+    )
 endif()
 
 set(LIBC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/prx/libc)
@@ -76,11 +97,19 @@ set_target_properties(libc PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${UNPATCHED_DIR}
         ARCHIVE_OUTPUT_DIRECTORY ${IMPLIB_DIR}
         BUILD_WITH_INSTALL_RPATH ON
-        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH "${ANYPS5_PRX_RPATH}"
 )
 
 set(LIBC_UNPATCHED ${UNPATCHED_DIR}/libc.prx)
 set(LIBC_PATCHED ${PATCHED_DIR}/libc.prx)
+set(LIBC_EXPORT_LIST ${CMAKE_CURRENT_BINARY_DIR}/libc.exports)
+
+add_custom_command(
+        OUTPUT ${LIBC_EXPORT_LIST}
+        COMMAND $<TARGET_FILE:nid_patcher> --write-export-list ${LIBC_UNPATCHED} ${LIBC_EXPORT_LIST}
+        DEPENDS nid_patcher libc ${LIBC_UNPATCHED}
+        COMMENT "Listing libc exports"
+)
 
 add_custom_command(
         OUTPUT ${LIBC_PATCHED}
@@ -131,7 +160,7 @@ foreach(LIB_DIR ${LIBS_DIRS})
                 LIBRARY_OUTPUT_DIRECTORY ${UNPATCHED_DIR}
                 ARCHIVE_OUTPUT_DIRECTORY ${IMPLIB_DIR}
                 BUILD_WITH_INSTALL_RPATH ON
-                INSTALL_RPATH "$ORIGIN"
+                INSTALL_RPATH "${ANYPS5_PRX_RPATH}"
         )
 
         set(UNPATCHED_FILE ${UNPATCHED_DIR}/${LIB_NAME}.prx)
@@ -140,8 +169,8 @@ foreach(LIB_DIR ${LIBS_DIRS})
         add_custom_command(
                 OUTPUT ${PATCHED_FILE}
                 COMMAND ${CMAKE_COMMAND} -E copy ${UNPATCHED_FILE} ${PATCHED_FILE}
-                COMMAND $<TARGET_FILE:nid_patcher> ${LIB_NAME} --preserve-exports "${LIBC_UNPATCHED}" "${PATCHED_FILE}"
-                DEPENDS nid_patcher ${LIB_NAME} ${UNPATCHED_FILE} ${LIBC_UNPATCHED}
+                COMMAND $<TARGET_FILE:nid_patcher> ${LIB_NAME} --preserve-export-list "${LIBC_EXPORT_LIST}" "${PATCHED_FILE}"
+                DEPENDS nid_patcher ${LIB_NAME} ${UNPATCHED_FILE} ${LIBC_EXPORT_LIST}
                 COMMENT "Patching NIDs for ${LIB_NAME}"
         )
 
@@ -179,23 +208,49 @@ if(BUILD_TESTING)
         set_tests_properties(guest_posix_scalar_io PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+    add_test_executable(nid_buffer_validation_tests nid/tests/BufferValidation.cpp)
+    target_include_directories(nid_buffer_validation_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/nid/include)
+    target_compile_features(nid_buffer_validation_tests PRIVATE cxx_std_20)
+    if(MINGW)
+        target_compile_options(nid_buffer_validation_tests PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME nid_buffer_validation COMMAND nid_buffer_validation_tests)
+    set_tests_properties(nid_buffer_validation PROPERTIES TIMEOUT 10)
+
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_gnu_hash COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_gnu_hash.py $<TARGET_FILE:nid_patcher>)
         add_test(NAME nid_patcher_macho COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_macho_nids.py $<TARGET_FILE:nid_patcher>)
+        add_test(NAME nid_patcher_native_paths COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_native_paths.py $<TARGET_FILE:nid_patcher>)
+        set_tests_properties(nid_patcher_native_paths PROPERTIES TIMEOUT 20)
     endif()
     add_test_executable(patched_libraries_tests tests/PatchedLibraries.cpp)
     add_dependencies(patched_libraries_tests libs)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_pe_references COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_pe_references.py $<TARGET_FILE:nid_patcher>)
+    endif()
     if(MINGW)
         target_compile_options(patched_libraries_tests PRIVATE -fasynchronous-unwind-tables)
         target_link_options(patched_libraries_tests PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
     add_test(NAME patched_libraries COMMAND patched_libraries_tests ${PATCHED_DIR})
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_elf_layout COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_elf_layout.py $<TARGET_FILE:nid_patcher>)
+    endif()
     add_test_executable(guest_kernel_sys_tests tests/GuestKernelSys.cpp)
     target_include_directories(guest_kernel_sys_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_kernel_sys_tests PRIVATE libkernel_sys libkernel libc)
     configure_windows_unwind(guest_kernel_sys_tests)
     add_test(NAME guest_kernel_sys COMMAND guest_kernel_sys_tests)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_verneed COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_verneed.py $<TARGET_FILE:nid_patcher>)
+    endif()
     if(WIN32)
         set_tests_properties(guest_kernel_sys PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel_sys>")
@@ -214,11 +269,23 @@ if(BUILD_TESTING)
         set_tests_properties(windows_write_watch PROPERTIES TIMEOUT 20)
     endif()
 
+    if(WIN32)
+        add_test_executable(undeliverable_host_exception_tests tests/UndeliverableHostException.cpp)
+        add_dependencies(undeliverable_host_exception_tests libc)
+        add_test(NAME undeliverable_host_exception COMMAND undeliverable_host_exception_tests $<TARGET_FILE:libc>)
+        set_tests_properties(undeliverable_host_exception PROPERTIES
+            PASS_REGULAR_EXPRESSION "C\\+\\+ exception St9bad_alloc raised on thread [0-9]+ cannot be delivered: 0x[0-9a-f]+ undeliverable_host_exception_tests\\.exe\\+0x[0-9a-f]+ has no unwind data")
+    endif()
+
     add_test_executable(guest_offline_imports_tests tests/GuestOfflineImports.cpp)
     target_include_directories(guest_offline_imports_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_offline_imports_tests PRIVATE libSceHttp libSceNpEntitlementAccess libSceRudp libc)
     configure_windows_unwind(guest_offline_imports_tests)
     add_test(NAME guest_offline_imports COMMAND guest_offline_imports_tests)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_shared_strings COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_shared_strings.py $<TARGET_FILE:nid_patcher>)
+    endif()
     if(WIN32)
         set_tests_properties(guest_offline_imports PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceHttp>")
@@ -410,6 +477,16 @@ if(BUILD_TESTING)
         set_tests_properties(guest_posix_random PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePosixForWebKit>")
     endif()
+
+    add_test_executable(MemoryPoolTest
+        tests/MemoryPoolTest.cpp
+        prx/libkernel/DirectMemory/MemoryPool.cpp
+    )
+    target_include_directories(MemoryPoolTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(MINGW)
+        target_compile_options(MemoryPoolTest PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME MemoryPoolTest COMMAND MemoryPoolTest)
 
     add_test_executable(guest_acm_tests tests/GuestAcm.cpp)
     target_include_directories(guest_acm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

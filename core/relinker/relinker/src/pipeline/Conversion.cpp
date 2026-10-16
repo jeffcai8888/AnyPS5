@@ -34,7 +34,7 @@ namespace Relinker {
 
 Conversion::Conversion(Domain::IProgress& progress) : progress(progress) {}
 
-ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOptions& options) const {
+ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOptions& options) const try {
     Domain::InputProgress inputProgress(progress, Io::Utf8Path(input.InputPath));
     static_assert(std::endian::native == std::endian::little);
     if (options.Target != TargetSystem::Linux && options.Target != TargetSystem::Windows && options.Target != TargetSystem::MacOs) throw Domain::RelinkerException("Unknown target system");
@@ -44,6 +44,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     if (input.InputPath.lexically_normal() == input.OutputPath.lexically_normal()) throw Domain::RelinkerException("Executable output would overwrite the input executable");
     if (!input.Modules.empty() && input.ModuleRoot.empty()) throw Domain::RelinkerException("Module root is required");
     if (options.WindowsDiagnostics && options.Target != TargetSystem::Windows) throw Domain::RelinkerException("Windows diagnostics require the Windows target");
+    if (options.LinuxFixedBase && options.Target != TargetSystem::Linux) throw Domain::RelinkerException("A fixed Linux base requires the Linux target");
     const bool windows = options.Target == TargetSystem::Windows;
     const bool macos = options.Target == TargetSystem::MacOs;
     inputProgress.Report({Domain::ProgressStage::Executable, Io::Utf8Path(input.InputPath), 0, 1});
@@ -55,7 +56,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         sourceBytes = std::move(converted.Bytes);
         trampolines = std::move(converted.Trampolines);
         std::map<std::string, std::size_t> stubsByName;
-        const auto counted = [](const std::string& name) { return name == "VRSQRTPS" || name == "VRCPPS" || name == "256-bit store"; };
+        const auto counted = [](const std::string& name) { return name == "VRSQRTPS" || name == "VRCPPS" || name == "256-bit store" || name == "scalar compare"; };
         for (const auto& report : converted.Reports) {
             if (report.Lowering == Codegen::Amd64OnlyLowering::Kept)
                 { std::ostringstream message; message << "Intel substitution: " << report.InstructionName << " at 0x" << std::hex << report.Offset << std::dec << " (" << report.OriginalLength << " bytes) kept: no room for a jump\n"; inputProgress.Message(message.str()); }
@@ -69,7 +70,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         { std::ostringstream message; message << "Intel conversion: " << converted.ReplacedCount << " in place, " << trampolines.size() << " stubs, " << converted.KeptCount << " kept\n"; inputProgress.Message(message.str()); }
     }
 
-    auto elfReader = std::make_shared<Relinker::ElfReader>(sourceBytes);
+    auto elfReader = std::make_shared<Relinker::ElfReader>(std::move(sourceBytes));
     const std::shared_ptr<Relinker::ISyscallScanner> syscallScanner = options.SkipSyscallCheck ? Relinker::MakeNullSyscallScanner() : Relinker::MakeSyscallScanner(inputProgress, options.TrapSdkSyscallStubs);
 
     const auto pipeline = std::make_shared<Relinker::RelinkerPipeline>(
@@ -84,7 +85,8 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
 
     { std::ostringstream message; message << "System: " << (windows ? "Windows" : macos ? "macOS" : "Linux") << "; unused-filter=" << options.UnusedFilterLevel << "\n"; inputProgress.Message(message.str()); }
     for (const auto& name : options.ExcludedModules) { std::ostringstream message; message << "Guest module excluded: " << name << '\n'; inputProgress.Message(message.str()); }
-    auto result = pipeline->Relink(sourceBytes);
+    auto result = pipeline->Relink();
+    sourceBytes = elfReader->TakeBytes();
     for (const auto& patch : result.Patches) {
         if (patch.Offset > sourceBytes.size() || patch.Bytes.size() > sourceBytes.size() - patch.Offset)
             throw Domain::RelinkerException("Relinker patch exceeds source image", patch.Offset);
@@ -102,7 +104,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     if (macos) {
         patcher = std::make_shared<Elfpatcher::MacOs::MacOsMachOPatcher>();
     } else if (windows) {
-        patcher = std::make_shared<Elfpatcher::Windows::WindowsPePatcher>(options.WindowsGui, std::move(input.Icon), input.InputPath.parent_path() / "sce_sys" / "icon0.png", [&](auto completed, auto total) { inputProgress.Report({Domain::ProgressStage::Image, {}, completed, total}); });
+        patcher = std::make_shared<Elfpatcher::Windows::WindowsPePatcher>(options.WindowsGui, std::move(input.Icon), input.InputPath.parent_path() / "sce_sys" / "icon0.png", [&](auto completed, auto total) { inputProgress.Report({Domain::ProgressStage::Image, {}, completed, total}); }, options.WindowsFixedBase, options.TraceImports);
     } else {
         patcher = std::make_shared<Elfpatcher::Linux::LinuxElfPatcher>(
             std::make_shared<Elfpatcher::EntryStubBuilder>(),
@@ -111,16 +113,17 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
                 byteWriter
             ),
             std::make_shared<Elfpatcher::SectionHeaderTableBuilder>(byteWriter),
-            byteWriter
+            byteWriter,
+            options.LinuxFixedBase
         );
     }
 
     if (!windows) inputProgress.Report({Domain::ProgressStage::Image, Io::Utf8Path(input.InputPath), 0, 1});
     std::vector<std::uint8_t> executableBytes;
     try {
-        executableBytes = patcher->Patch(sourceBytes, result.OriginalHeaders, result.DynamicSection, result.OriginalPltGotVaddr, options.RunPath, options.LazyBinding, options.WindowsDiagnostics, trampolines);
+        executableBytes = patcher->Patch(std::move(sourceBytes), result.OriginalHeaders, result.DynamicSection, result.OriginalPltGotVaddr, options.RunPath, options.LazyBinding, options.WindowsDiagnostics, trampolines);
     } catch (Domain::RelinkerException& error) {
-        error.InputPath = Io::Utf8Path(input.InputPath);
+        if (error.InputPath.empty()) error.InputPath = Io::Utf8Path(input.InputPath);
         throw;
     }
 
@@ -129,6 +132,9 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     if (windows) diagnostics = std::static_pointer_cast<Elfpatcher::Windows::WindowsPePatcher>(patcher)->GetDiagnostics();
     inputProgress.Report({Domain::ProgressStage::Executable, Io::Utf8Path(input.InputPath), 1, 1});
     return {std::move(executableBytes), std::move(guestArtifacts), std::move(result), std::move(diagnostics)};
+} catch (Domain::RelinkerException& error) {
+    if (error.InputPath.empty()) error.InputPath = Io::Utf8Path(input.InputPath);
+    throw;
 }
 
 }

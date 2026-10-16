@@ -251,8 +251,10 @@ int APS5_VABI scePadSetVibration(int handle, const PadVibrationParam* param) {
 }
 
 int APS5_VABI scePadSetVibrationMode(int handle, int mode) {
+ if (!Pad::IsInitialized()) return PAD_ERROR_NOT_INITIALIZED;
+ if (mode <= 0) return PAD_ERROR_INVALID_ARG;
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
- if (mode < 0 || mode > 3) return PAD_ERROR_INVALID_ARG;
+ if (mode > 3 && mode != 5) return PAD_ERROR_INVALID_ARG;
  Pad::SetVibrationMode(mode);
  return PAD_OK;
 }
@@ -315,6 +317,12 @@ int APS5_VABI scePadUnknown_n3kSX62fgNo() {
 }
 
 int APS5_VABI scePadVrControllerGetTriggerEffectStates(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+APS5_EXPORT("zBsgF0q8DIM", scePadUnknown_zBsgF0q8DIM);
+int APS5_VABI scePadUnknown_zBsgF0q8DIM() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
