@@ -207,7 +207,9 @@ ResourceCache 钉住            本 fork 字节预算          ✅ 本 fork
 
 | 提交 | 内容 |
 |---|---|
-| (未提交) | 顶点 barrier、ShaderRegistry 异常上下文、DeviceBuffer usage/1GiB 回退、SrtEvaluator 回到上游+固定根零读、ORDERED_APPEND、内存加载调用目标、ds_ordered_count、缓存键审核名单 |
+| `8c66a1c2` | ORDERED_APPEND、内存加载调用目标、ds_ordered_count、SrtEvaluator 回到上游+固定根零读、ShaderRegistry 异常上下文、缓存键审核名单 |
+| `c7863bb4` | 顶点阶段 s_barrier |
+| `e9bd20e4` | DeviceBuffer 池 usage + 1GiB 宿主回退 |
 | `805d93af` | 稳定的资源缓存计数 + 有界的设备压力淘汰 |
 | `14f636b8` | 设备压力感知的纹理缓存淘汰 |
 | `d18190f7` | 本文档 |
@@ -255,7 +257,7 @@ ResourceCache 钉住            本 fork 字节预算          ✅ 本 fork
 
 ## 12. 路线图
 
-0. 查清同步分支崩溃点之后的掉帧(§9 第 0 条);提交 6+ 个未提交修复;跑完完整 ctest,排查 11 个超时项;
+0. 查清同步分支崩溃点之后的掉帧(§9 第 0 条);跑完完整 ctest,排查 11 个超时项;
 1. **渲染目标 LRU 字节预算**(8GB 最后一墙)→ 可玩帧率;
 2. 4K 目标拷贝缓冲"用完即还";
 3. 移植体验树残余(共享纹理路由等)并合并双树;
