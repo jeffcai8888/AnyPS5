@@ -46,7 +46,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
-    if (const auto allocation = cache->Take(size, usage, properties)) {
+    if (const auto allocation = cache->Take(size, this->usage, properties)) {
         buffer = allocation->buffer;
         memory = allocation->memory;
         mapping = allocation->mapping;
@@ -155,11 +155,11 @@ void Buffer::Invalidate() {
     Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
-DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(usage) {
+DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
     Require(size != 0, "zero-sized device buffer");
-    if (size >= 16u * 1024 * 1024) std::fprintf(stderr, "[gpu] device buffer alloc %zu bytes usage 0x%x\n", size, usage);
+    if (size >= 16u * 1024 * 1024) std::fprintf(stderr, "[gpu] device buffer alloc %zu bytes usage 0x%x\n", size, this->usage);
     cache = GetBufferPool(context);
-    if (const auto allocation = cache->Take(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+    if (const auto allocation = cache->Take(size, this->usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
         buffer = allocation->buffer;
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
@@ -190,9 +190,12 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         try {
             memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
         } catch (const std::runtime_error&) {
-            if (capacity < 4ull * 1024 * 1024) throw;
-            // A staging request video memory cannot serve (8 GiB cards) falls back to cached host
-            // memory: the GPU streams the buffer over PCIe instead of failing.
+            // Only a request past a gigabyte (the 4 GiB staging buffers an 8 GiB card cannot place
+            // in video memory) falls back. Smaller failures stay failures: the pool's own retry
+            // already reclaimed what it could, and a host stand-in for those would hide the error.
+            if (capacity < 1ull << 30u) throw;
+            hostFallback = true;
+            // The GPU streams the buffer over PCIe instead of failing.
             static std::mutex fallbackMutex;
             static std::set<std::size_t> reported;
             {
@@ -218,7 +221,8 @@ DeviceBuffer::~DeviceBuffer() {
 }
 
 void DeviceBuffer::release() noexcept {
-    if (buffer && memory && cache) {
+    // A host fallback is not device-local, so it must not re-enter the device tier.
+    if (buffer && memory && cache && !hostFallback) {
         cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size});
         return;
     }
