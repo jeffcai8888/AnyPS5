@@ -82,6 +82,7 @@ std::uint32_t BuiltInForInput(StageInputKind kind) {
 std::uint32_t PerVertexType(SpirvEmitterState& state) {
     return state.module.DecoratedType(spv::OpTypeStruct,
         {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+         {spv::OpMemberDecorate, {0u, spv::DecorationInvariant}},
          {spv::OpDecorate, {spv::DecorationBlock}}},
         TypeF32Vector(state, 4u));
 }
@@ -119,7 +120,7 @@ std::uint32_t PushConstantArrayType(SpirvEmitterState& state) {
 
 std::uint32_t PushConstantBlockType(SpirvEmitterState& state) {
     return state.module.DecoratedType(spv::OpTypeStruct,
-        {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}},
+        {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, state.program.Metadata().bindings.PushSlotDword() * 4u}},
          {spv::OpDecorate, {spv::DecorationBlock}}},
         PushConstantArrayType(state));
 }
@@ -171,7 +172,25 @@ void DefineInputs(SpirvEmitterState& state) {
             addBuiltin(StageInputKind::WorkgroupId, 3u, "gl_WorkGroupID");
         }
     }
+    if (LdsInDeviceMemory(state)) {
+        if (std::none_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) {
+            return input.kind == StageInputKind::WorkgroupId;
+        })) {
+            state.inputs.push_back(SpirvInputBinding {{StageInputKind::WorkgroupId, 0u, 3u, "gl_WorkGroupID", false}});
+        }
+        state.numWorkgroupsVariable = DefineInterfaceVariable(state, TypeU32Vector(state, 3u), spv::StorageClassInput, "gl_NumWorkGroups");
+        state.module.AddAnnotation(spv::OpDecorate, state.numWorkgroupsVariable, spv::DecorationBuiltIn, spv::BuiltInNumWorkgroups);
+    }
     const bool pixelStage = state.program.Resources().stage == IrShaderStage::Pixel;
+    const bool emulated = pixelStage && state.program.Metadata().barycentricEmulation;
+    BarycentricEmulationLayout emulation;
+    if (emulated) {
+        const auto parameters = DescribeFragmentParameters(state.program, state.inputInfo);
+        const auto reads = [&](StageInputKind kind) {
+            return std::any_of(state.inputs.begin(), state.inputs.end(), [&](const SpirvInputBinding& input) { return input.kind == kind; });
+        };
+        emulation = LayoutBarycentricEmulation(parameters, {true, reads(StageInputKind::BaryCoordSmooth), reads(StageInputKind::BaryCoordNoPerspective)});
+    }
     for (auto& input : state.inputs) {
         if (pixelStage && input.kind == StageInputKind::Parameter) {
             const auto location = PixelParameterLocation(state, input.location);
@@ -235,7 +254,15 @@ void DefineInputs(SpirvEmitterState& state) {
         }
         if (input.kind == StageInputKind::Parameter) {
             const auto flat = PixelParameterIsFlat(state, input.location);
-            if (input.perVertex) {
+            auto location = PixelParameterLocation(state, input.location);
+            if (input.perVertex && emulated) {
+                const auto relocated = std::find_if(emulation.perVertexLocations.begin(), emulation.perVertexLocations.end(), [&](const auto& entry) { return entry.first == location; });
+                if (relocated == emulation.perVertexLocations.end()) {
+                    throw std::runtime_error("SPIR-V module emission failed: per-vertex parameter " + std::to_string(location) + " has no emulated location");
+                }
+                location = relocated->second;
+                state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationFlat);
+            } else if (input.perVertex) {
                 state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationPerVertexKHR);
             } else if (flat) {
                 state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationFlat);
@@ -243,7 +270,13 @@ void DefineInputs(SpirvEmitterState& state) {
             if (!flat && !input.perVertex && PixelParameterIsLinear(state, input.location)) {
                 state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationNoPerspective);
             }
-            state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationLocation, PixelParameterLocation(state, input.location));
+            state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationLocation, location);
+        } else if (emulated && (input.kind == StageInputKind::BaryCoordSmooth || input.kind == StageInputKind::BaryCoordNoPerspective)) {
+            const bool linear = input.kind == StageInputKind::BaryCoordNoPerspective;
+            if (linear) {
+                state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationNoPerspective);
+            }
+            state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationLocation, linear ? emulation.linearLocation : emulation.smoothLocation);
         } else if (const auto builtin = BuiltInForInput(input.kind); builtin != NoBuiltIn) {
             state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationBuiltIn, builtin);
         }
@@ -257,6 +290,8 @@ void DefineInputs(SpirvEmitterState& state) {
         }
     }
 }
+
+constexpr std::uint32_t MaxClipDistances = 8u;
 
 void DefineOutputs(SpirvEmitterState& state) {
     state.outputs.reserve(state.program.Info().outputs.size());
@@ -273,6 +308,18 @@ void DefineOutputs(SpirvEmitterState& state) {
     if (state.program.Resources().stage == IrShaderStage::Mesh) {
         DefineMeshOutputs(state);
         return;
+    }
+    const auto stage = state.program.Resources().stage;
+    const bool exportsPosition = std::ranges::any_of(state.outputs, [](const SpirvOutputBinding& output) { return output.kind == StageOutputKind::Position; });
+    if (exportsPosition && (stage == IrShaderStage::Vertex || stage == IrShaderStage::TessellationEvaluation)) {
+        if (std::ranges::find(state.supportedCapabilities, spv::CapabilityClipDistance) == state.supportedCapabilities.end()) {
+            FailEmit("clipping a primitive with an all-zero clip position needs shaderClipDistance on the target device");
+        }
+        state.zeroPositionClipIndex = clipDistanceCount;
+        clipDistanceCount += 1u;
+        if (clipDistanceCount > MaxClipDistances) {
+            FailEmit("guest clip distances plus the all-zero clip position distance exceed " + std::to_string(MaxClipDistances) + " clip distances");
+        }
     }
     const auto BuiltIn = [&](std::uint32_t& variable, std::uint32_t type, const char* name, std::uint32_t builtin) {
         if (variable == 0u) {
@@ -312,6 +359,9 @@ void DefineOutputs(SpirvEmitterState& state) {
         case StageOutputKind::SampleMask:
             binding.variableId = BuiltIn(state.sampleMaskVariable, SampleMaskArrayType(state), "gl_SampleMask", spv::BuiltInSampleMask);
             break;
+        case StageOutputKind::StencilRef:
+            binding.variableId = BuiltIn(state.stencilRefVariable, TypeI32(state), "gl_FragStencilRefARB", spv::BuiltInFragStencilRefEXT);
+            break;
         case StageOutputKind::Parameter:
         case StageOutputKind::Mrt: {
             const bool uintOutput = binding.kind == StageOutputKind::Mrt && state.program.Resources().stage == IrShaderStage::Pixel && binding.index < std::size(PixelInfo(state).targetOutputMode) && PixelInfo(state).targetOutputMode[binding.index] == 7u;
@@ -322,12 +372,19 @@ void DefineOutputs(SpirvEmitterState& state) {
         }
         }
     }
+    if (state.zeroPositionClipIndex) {
+        BuiltIn(state.clipDistanceVariable, F32ArrayType(state, clipDistanceCount), "gl_ClipDistance", spv::BuiltInClipDistance);
+    }
+    if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psAlphaToCoverage) {
+        if (state.inputInfo.pixel->psSampleMaskExportEnable) throw std::runtime_error("alpha-to-coverage with a sample-mask export is unsupported");
+        BuiltIn(state.sampleMaskVariable, SampleMaskArrayType(state), "gl_SampleMask", spv::BuiltInSampleMask);
+    }
 }
 
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
-    if (layout.UsesPushData() || stage == IrShaderStage::Mesh) {
+    if (layout.UsesPushData() || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl) {
         const auto type = PushConstantBlockType(state);
         state.pushConstantVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
         state.module.AddName(type, "BufferResource");
@@ -337,26 +394,28 @@ void DefineDescriptors(SpirvEmitterState& state) {
         const auto Define = [&](std::uint32_t type, const char* name, std::uint32_t storage = spv::StorageClassStorageBuffer) {
             const auto variable = state.module.DefineGlobalVariable(TypePointer(state, storage, type), storage);
             state.module.AddName(variable, name);
-            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0u);
+            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, state.fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet);
             state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, NativeBinding(stage, binding.kind));
             return variable;
         };
         const auto ArrayType = [&](std::uint32_t type) {
             const bool heap = binding.kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(binding.kind) != ImageResourceClass::None;
             const auto count = static_cast<std::uint32_t>(binding.resources.size());
-            const auto length = heap ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::HeapCountBase + static_cast<std::uint32_t>(binding.kind), count) : ConstantU32(state, count);
+            const auto length = heap && !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::HeapCountBase + static_cast<std::uint32_t>(binding.kind), count) : ConstantU32(state, count);
             return state.module.Type(spv::OpTypeArray, type, length);
         };
         switch (binding.kind) {
         case DescriptorBindingKind::Buffers:
             state.storageBufferVariable = Define(ArrayType(StorageBufferBlockType(state)), "buffers");
-            if (state.requirements.bufferInt64Atomics) {
-                state.storageBufferU64Variable = Define(ArrayType(StorageBufferU64BlockType(state)), "buffers_u64");
-                state.module.AddAnnotation(spv::OpDecorate, state.storageBufferVariable, spv::DecorationAliased);
-                state.module.AddAnnotation(spv::OpDecorate, state.storageBufferU64Variable, spv::DecorationAliased);
+            if (state.requirements.coherentBufferAlias) state.storageBufferCoherentVariable = Define(ArrayType(StorageBufferBlockType(state)), "buffers_coherent");
+            if (state.requirements.bufferInt64Atomics) state.storageBufferU64Variable = Define(ArrayType(StorageBufferU64BlockType(state)), "buffers_u64");
+            if (state.storageBufferU64Variable != 0u || state.storageBufferCoherentVariable != 0u) {
+                for (const auto variable : {state.storageBufferVariable, state.storageBufferCoherentVariable, state.storageBufferU64Variable}) {
+                    if (variable != 0u) state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+                }
             }
             if (state.requirements.coherentBuffers) {
-                state.module.AddAnnotation(spv::OpDecorate, state.storageBufferVariable, spv::DecorationCoherent);
+                state.module.AddAnnotation(spv::OpDecorate, state.storageBufferCoherentVariable != 0u ? state.storageBufferCoherentVariable : state.storageBufferVariable, spv::DecorationCoherent);
                 if (state.storageBufferU64Variable != 0u) state.module.AddAnnotation(spv::OpDecorate, state.storageBufferU64Variable, spv::DecorationCoherent);
             }
             break;
@@ -394,6 +453,13 @@ void DefineDescriptors(SpirvEmitterState& state) {
             break;
         }
         }
+    }
+    if (LdsInDeviceMemory(state)) {
+        state.ldsBufferVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferBlockType(state)), spv::StorageClassStorageBuffer);
+        state.module.AddName(state.ldsBufferVariable, "workgroup_memory");
+        state.module.AddAnnotation(spv::OpDecorate, state.ldsBufferVariable, spv::DecorationDescriptorSet, WorkgroupMemoryDescriptorSet);
+        state.module.AddAnnotation(spv::OpDecorate, state.ldsBufferVariable, spv::DecorationBinding, 0u);
+        state.module.AddAnnotation(spv::OpDecorate, state.ldsBufferVariable, spv::DecorationCoherent);
     }
 }
 

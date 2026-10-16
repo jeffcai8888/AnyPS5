@@ -87,7 +87,17 @@ int MutexOperations::Timedlock(PthreadMutex* mutex, const KernelTimespec* abstim
     if (std::chrono::duration<long double>(duration) >= std::chrono::duration<long double>(std::chrono::system_clock::duration::max()))
         throw std::overflow_error("Absolute mutex timeout exceeds the host clock range");
     const auto deadline = std::chrono::system_clock::time_point(std::chrono::duration_cast<std::chrono::system_clock::duration>(duration));
-    return acquireMutex(resolveMutex(mutex, true), [&](auto& native) { return native.try_lock_until(deadline); }, sceTimedOut, false);
+    return acquireMutex(resolveMutex(mutex, true), [&](auto& native) {
+#ifdef _WIN32
+        while (!native.try_lock()) {
+            if (std::chrono::system_clock::now() >= deadline) return false;
+            TimedWait::SleepNanos(1000000);
+        }
+        return true;
+#else
+        return native.try_lock_until(deadline);
+#endif
+    }, sceTimedOut, false);
 }
 
 extern "C" {
@@ -101,7 +111,7 @@ int APS5_VABI scePthreadMutexattrInit(PthreadMutexattr* attr) {
 
 int APS5_VABI scePthreadMutexattrDestroy(PthreadMutexattr* attr) {
     if (!attr || !*attr)
-        throw std::invalid_argument("Mutex attributes are not initialized");
+        return SCE_KERNEL_ERROR_EINVAL;
     delete *attr;
     *attr = nullptr;
     return 0;
@@ -109,7 +119,7 @@ int APS5_VABI scePthreadMutexattrDestroy(PthreadMutexattr* attr) {
 
 int APS5_VABI scePthreadMutexattrSettype(PthreadMutexattr* attr, int type) {
     if (!attr || !*attr)
-        throw std::invalid_argument("Mutex attributes are not initialized");
+        return SCE_KERNEL_ERROR_EINVAL;
     switch (type) {
     case 1: (*attr)->type = MutexType::ErrorCheck; break;
     case 2: (*attr)->type = MutexType::Recursive; break;
@@ -122,21 +132,19 @@ int APS5_VABI scePthreadMutexattrSettype(PthreadMutexattr* attr, int type) {
 
 int APS5_VABI scePthreadMutexattrSetprotocol(PthreadMutexattr* attr, int protocol) {
     if (!attr || !*attr)
-        throw std::invalid_argument("Mutex attributes are not initialized");
+        return SCE_KERNEL_ERROR_EINVAL;
     constexpr int PrioNone = 0;
-    constexpr int PrioInherit = 1;
-    if (protocol != PrioNone && protocol != PrioInherit)
-        throw std::invalid_argument("Mutex priority protection is unsupported");
+    constexpr int PrioProtect = 2;
+    if (protocol < PrioNone || protocol > PrioProtect)
+        return SCE_KERNEL_ERROR_EINVAL;
     return 0;
 }
 
 int APS5_VABI scePthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* attr, const char*) {
     if (!mutex)
         throw std::invalid_argument("Mutex pointer is null");
-    if (attr && !*attr)
-        throw std::invalid_argument("Mutex attributes are not initialized");
     auto replacement = std::make_unique<PthreadMutexPrivate>();
-    if (attr)
+    if (attr && *attr)
         replacement->_type = (*attr)->type;
     std::lock_guard lock(initializationMutex);
     std::atomic_ref<PthreadMutex>(*mutex).store(replacement.release(), std::memory_order_release);
@@ -148,7 +156,7 @@ int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex) {
         throw std::invalid_argument("Mutex pointer is null");
     std::lock_guard lock(initializationMutex);
     if (*mutex == destroyedMutex())
-        throw std::runtime_error("Mutex has already been destroyed");
+        return SCE_KERNEL_ERROR_EINVAL;
     if (*mutex == adaptiveInitializer()) {
         std::atomic_ref<PthreadMutex>(*mutex).store(destroyedMutex(), std::memory_order_release);
         return 0;
@@ -161,7 +169,14 @@ int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex) {
-    return acquireMutex(resolveMutex(mutex, true), [](auto& native) { native.lock(); return true; }, 0, false);
+    return acquireMutex(resolveMutex(mutex, true), [](auto& native) {
+#ifdef _WIN32
+        while (!native.try_lock()) TimedWait::SleepNanos(1000000);
+#else
+        native.lock();
+#endif
+        return true;
+    }, 0, false);
 }
 
 int APS5_VABI scePthreadMutexUnlock(PthreadMutex* mutex) {

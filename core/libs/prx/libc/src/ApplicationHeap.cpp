@@ -23,6 +23,7 @@ using Realign = void* (APS5_VABI *)(void*, std::size_t, std::size_t);
 using PosixAlign = int (APS5_VABI *)(void**, std::size_t, std::size_t);
 using Initialize = void (APS5_VABI *)();
 using Stats = int (APS5_VABI *)(void*);
+using UsableSize = std::size_t (APS5_VABI *)(void*);
 
 std::mutex heapMutex;
 std::array<void*, 10> heapApi{};
@@ -47,6 +48,7 @@ int APS5_VABI defaultPosixAlign(void** pointer, std::size_t alignment, std::size
     if (pointer == nullptr || alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) return 22;
     try { *pointer = defaultAlign(alignment, bytes); return 0; }
     catch (const std::bad_alloc&) { return 12; }
+    catch (const std::length_error&) { return 12; }
 }
 
 std::array<void*, 10> defaultApi() {
@@ -174,7 +176,7 @@ void ApplicationHeapFree_nid_no_patch(void* pointer) {
 }
 
 void* ApplicationHeapReallocate_nid_no_patch(void* pointer, std::size_t bytes) {
-    if (bytes == 0) {
+    if (bytes == 0 && pointer != nullptr) {
         ApplicationHeapFree_nid_no_patch(pointer);
         return nullptr;
     }
@@ -247,4 +249,21 @@ int ApplicationHeapStatsFast_nid_no_patch(void* stats) {
     }
     CallbackScope scope;
     return statsFast(stats);
+}
+
+std::size_t ApplicationHeapUsableSize_nid_no_patch(void* pointer) {
+    UsableSize usableSize = nullptr;
+    {
+        std::lock_guard lock(heapMutex);
+        if (heapFailure) std::rethrow_exception(heapFailure);
+        if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
+        if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
+        if (heapApi != defaultApi()) {
+            if (heapApi[9] == nullptr) throw std::runtime_error("malloc_usable_size: implemented only for an application allocator that provides it");
+            std::memcpy(&usableSize, &heapApi[9], sizeof(usableSize));
+        }
+    }
+    if (usableSize == nullptr) return GuestHeap::GuestHeapUsableSize_nid_postfix(pointer);
+    CallbackScope scope;
+    return usableSize(pointer);
 }

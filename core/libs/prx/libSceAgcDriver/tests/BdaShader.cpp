@@ -3,15 +3,19 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+#include "SpirvBackend/SpirvOptimizer.hpp"
+#endif
 
 namespace {
 
 template<typename TEmit>
-std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0) {
+std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
     program.Info().usesDma = true;
+    program.Info().bdaWrites = writes;
     if (coherent) {
         MemoryInfo memory;
         memory.coherent = true;
@@ -39,7 +43,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
     SpirvValueEmitContext ctx(state);
-    auto& instruction = extracted != 0u ? program.CreateValue(IrOpcode::LoadAddressU32x4, IrType::U32x4) : program.CreateValue(IrOpcode::LoadAddressU32, IrType::U32);
+    auto& instruction = writes ? program.CreateValue(IrOpcode::StoreAddressU32, IrType::Void) : extracted != 0u ? program.CreateValue(IrOpcode::LoadAddressU32x4, IrType::U32x4) : program.CreateValue(IrOpcode::LoadAddressU32, IrType::U32);
     IrBuilder ir(program);
     for (std::uint32_t dword = 0; dword < 4u; ++dword) {
         if ((extracted & (1u << dword)) == 0u) continue;
@@ -83,10 +87,49 @@ std::vector<std::uint32_t> MakeBdaSpanReadTestShader(std::uint64_t address, std:
     }, extracted);
 }
 
+std::vector<std::uint32_t> MakeBdaDwordWriteTestShader(std::uint64_t address, std::uint32_t dwords, const std::uint32_t* values) {
+    using namespace ShaderRecompiler;
+    return MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+        auto& state = ctx.state;
+        std::vector<std::uint32_t> parts;
+        for (std::uint32_t dword = 0; dword < dwords; ++dword) parts.push_back(ConstantU32(state, values[dword]));
+        const auto composite = state.module.AllocateId();
+        if (dwords == 2u) state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2u), composite, parts[0], parts[1]);
+        else if (dwords == 3u) state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3u), composite, parts[0], parts[1], parts[2]);
+        else state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), composite, parts[0], parts[1], parts[2], parts[3]);
+        EmitBdaDwordWrites(ctx, instruction, base, 0u, dwords, composite);
+        return std::vector<std::uint32_t>{ConstantU32(state, 1u)};
+    }, 0u, true);
+}
+
 std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops) {
     using namespace ShaderRecompiler;
     return MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
         const auto values = EmitBdaDwordReads(ctx, instruction, base, 0u, dwords, true);
         return std::vector<std::uint32_t>(values.begin(), values.begin() + dwords);
     });
+}
+
+std::vector<std::uint32_t> MakeBdaStoreTestShader(std::uint64_t address, std::uint32_t value, std::uint32_t bits, bool coherent) {
+    using namespace ShaderRecompiler;
+    auto shader = MakeShader(address, coherent, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+        EmitBdaStore(ctx, instruction, base, ConstantU32(ctx.state, value), bits);
+        return std::vector<std::uint32_t>{ConstantU32(ctx.state, 1u)};
+    }, 0u, true);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    shader = ValidateAndOptimizeSpirv(shader, VK_API_VERSION_1_1, shader[1], false, false);
+#endif
+    return shader;
+}
+
+std::vector<std::uint32_t> MakeBdaWriteTestShader(std::uint64_t address, std::uint32_t value, std::uint32_t bits, bool coherent) {
+    using namespace ShaderRecompiler;
+    auto shader = MakeShader(address, coherent, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+        EmitBdaWrite(ctx, instruction, base, ConstantU32(ctx.state, value), bits);
+        return std::vector<std::uint32_t>{ConstantU32(ctx.state, 1u)};
+    }, 0u, true);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    shader = ValidateAndOptimizeSpirv(shader, VK_API_VERSION_1_1, shader[1], false, false);
+#endif
+    return shader;
 }

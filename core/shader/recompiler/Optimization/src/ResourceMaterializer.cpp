@@ -91,7 +91,7 @@ RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaIm
         case ImageType::Cube:
             return RdnaImageDimension::Dim2DArray;
         case ImageType::Color2DArray:
-            return wantArray ? RdnaImageDimension::Dim2DArray : RdnaImageDimension::Dim2D;
+            return wantArray || requested == RdnaImageDimension::Dim3D ? RdnaImageDimension::Dim2DArray : RdnaImageDimension::Dim2D;
         case ImageType::Color2DMsaaArray:
             return wantArray ? RdnaImageDimension::Dim2DMsaaArray : RdnaImageDimension::Dim2DMsaa;
         case ImageType::Color2D:
@@ -191,7 +191,7 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
             if (((descriptorImageSwizzle(descriptor) >> (component * 3u)) & 7u) == 7u) throw std::runtime_error("selects a channel the converted image format does not have");
         }
     }
-    decoded.srgbDecode = !storage && (srgbDecodeFormats & SrgbDecodeBit(format)) != 0u;
+    decoded.srgbDecode = !storage && !base.depthCompare && (srgbDecodeFormats & SrgbDecodeBit(format)) != 0u;
     if (decoded.srgbDecode && !base.srgbDecodeCompatible) {
         throw std::runtime_error("samples or gathers an sRGB image the device cannot sample, which is not implemented");
     }
@@ -444,7 +444,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
 
     std::vector<DescriptorValue> values;
     std::vector<std::uint8_t> activeSources;
-    walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources, &snapshot.srtPoison);
+    walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources, &snapshot.srtPoison, &snapshot.nullRootReads);
 
     std::size_t cursor = 0;
     if (values.size() < plan.info.buffers.size()) {
@@ -487,6 +487,11 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         if (descriptor.dwordCount != 8u) {
             throw std::runtime_error("image descriptor has an invalid width");
         }
+        const auto activity = plan.descriptorSources.size() + i;
+        if (activity < activeSources.size() && activeSources[activity] == 0u) {
+            descriptor = DescriptorValue{};
+            descriptor.dwordCount = 8u;
+        }
         if (!validImageDescriptor(descriptor, image.r128) && !nullImageDescriptor(descriptor)) {
             throw std::runtime_error("runtime image descriptor is invalid");
         }
@@ -501,10 +506,13 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
 
 std::uint32_t colorCompareReference(IrBufferFormat format) {
     switch (format) {
-    case IrBufferFormat::Format8UNorm: case IrBufferFormat::Format8_8UNorm: case IrBufferFormat::Format16_16UNorm:
+    case IrBufferFormat::Format16_16UNorm:
     case IrBufferFormat::Format11_11_10UNorm: case IrBufferFormat::Format10_11_11UNorm: case IrBufferFormat::Format2_10_10_10UNorm:
-    case IrBufferFormat::Format10_10_10_2UNorm: case IrBufferFormat::Format8_8_8_8UNorm: case IrBufferFormat::Format16_16_16_16UNorm:
+    case IrBufferFormat::Format10_10_10_2UNorm: case IrBufferFormat::Format16_16_16_16UNorm:
         return EmulatedCompare::ReferenceUnorm;
+    case IrBufferFormat::Format8UNorm: case IrBufferFormat::Format8_8UNorm: case IrBufferFormat::Format8_8_8_8UNorm:
+    case IrBufferFormat::Format8Srgb: case IrBufferFormat::Format8_8Srgb: case IrBufferFormat::Format8_8_8_8Srgb:
+        return EmulatedCompare::ReferenceZero;
     case IrBufferFormat::Format8SNorm: case IrBufferFormat::Format16SNorm: case IrBufferFormat::Format8_8SNorm: case IrBufferFormat::Format16_16SNorm:
     case IrBufferFormat::Format11_11_10SNorm: case IrBufferFormat::Format10_11_11SNorm: case IrBufferFormat::Format2_10_10_10SNorm:
     case IrBufferFormat::Format10_10_10_2SNorm: case IrBufferFormat::Format8_8_8_8SNorm: case IrBufferFormat::Format16_16_16_16SNorm:
@@ -527,8 +535,16 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
     if ((image.emulatedCompare & EmulatedCompare::RequiresSingleLevel) != 0u && ((descriptor.dwords[3] >> 12u) & 0xfu) != ((descriptor.dwords[3] >> 16u) & 0xfu)) throw std::runtime_error("color comparison requires a single mip level");
     const auto reference = colorCompareReference(format);
     const auto type = rawImageType(descriptor);
-    if (type != ImageType::Color2D && type != ImageType::Color2DArray) throw std::runtime_error("comparison sampling of a color texture is implemented only for 2D and 2D array views");
-    if ((descriptorImageSwizzle(descriptor) & 0x7u) != 4u) throw std::runtime_error("comparison sampling of a color texture is implemented only when the view's X channel is red");
+    if (type != ImageType::Color2D && type != ImageType::Color2DArray && type != ImageType::Cube) throw std::runtime_error("comparison sampling of a color texture is implemented only for 2D, 2D array and cube views");
+    bool redChannel = false;
+    bool compareChannel = false;
+    for (std::uint32_t channel = 0u; channel < 4u; ++channel) {
+        const auto select = (descriptorImageSwizzle(descriptor) >> (channel * 3u)) & 0x7u;
+        if (select == 2u || select == 3u) throw std::runtime_error("comparison sampling of a color texture is implemented only when every view channel is a constant or a color channel");
+        redChannel = redChannel || select == 4u;
+        compareChannel = compareChannel || select >= 4u;
+    }
+    if (compareChannel && !redChannel) throw std::runtime_error("comparison sampling of a color texture is implemented only when a view channel selects red");
     std::optional<std::uint32_t> samplerState;
     for (const auto& pair : info.sampledPairs) {
         if (pair.image != index) continue;
@@ -541,6 +557,10 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
         if (((words[0] >> 29u) & 0x3u) != 0u) throw std::runtime_error("comparison sampling of a color texture through a min or max reduction sampler is not implemented");
         const auto magFilter = (words[2] >> 20u) & 0x3u;
         const auto minFilter = (words[2] >> 22u) & 0x3u;
+        const bool constantZero = reference == EmulatedCompare::ReferenceZero;
+        if (type == ImageType::Cube && magFilter == 1u && ((words[0] >> 28u) & 1u) == 0u && !constantZero) {
+            throw std::runtime_error("bilinear cube comparison requires DISABLE_CUBE_WRAP to avoid seamless face filtering");
+        }
         const auto addressMode = [](std::uint32_t clamp) {
             if (clamp == 0u) return EmulatedCompare::AddressWrap;
             if (clamp == 2u) return EmulatedCompare::AddressEdge;
@@ -552,7 +572,7 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
         const auto borderType = (words[3] >> 30u) & 0x3u;
         const bool border = addressX == EmulatedCompare::AddressBorder || addressY == EmulatedCompare::AddressBorder;
         if (border && borderType == 3u) throw std::runtime_error("comparison sampling of a color texture with a border color table is not implemented");
-        if (magFilter != minFilter || magFilter > 1u) throw std::runtime_error("comparison sampling of a color texture is implemented only with equal point or bilinear minification and magnification filters");
+        if (!constantZero && (magFilter != minFilter || magFilter > 1u)) throw std::runtime_error("comparison sampling of a color texture is implemented only with equal point or bilinear minification and magnification filters");
         if (unnormalized) throw std::runtime_error("comparison sampling of a color texture does not implement unnormalized coordinates");
         const auto state = EmulatedCompare::Enabled | (function << EmulatedCompare::FunctionShift) | (magFilter == 1u ? EmulatedCompare::Linear : 0u)
             | (addressX << EmulatedCompare::ClampXShift) | (addressY << EmulatedCompare::ClampYShift) | (border && borderType == 2u ? EmulatedCompare::BorderWhite : 0u);
@@ -619,7 +639,7 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         mode.depthBits = depth;
         mode.depthUnorm16 = unorm16;
         mode.cube = false;
-        mode.mipCount = mode.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageHeapCapacity : 1u;
+        mode.mipCount = mode.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageMipSlots : 1u;
         mode.shaderSwizzle = ShaderImageIdentitySwizzle;
         if (conversion == IrBufferFormat::Format11_11_10UNorm || conversion == IrBufferFormat::Format10_11_11Float) mode.shaderSwizzle = 0x2acu;
         modes.push_back(mode);
@@ -627,6 +647,28 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             auto volume = mode;
             volume.dimension = RdnaImageDimension::Dim3D;
             modes.push_back(volume);
+        }
+        if (image.dimension == RdnaImageDimension::Dim3D && image.flatVolumeCompatible && !storage && !depth && conversion == IrBufferFormat::Invalid && packed == IrBufferFormat::Invalid) {
+            for (const auto dimension : {RdnaImageDimension::Dim2D, RdnaImageDimension::Dim2DArray}) {
+                auto plane = mode;
+                plane.dimension = dimension;
+                modes.push_back(plane);
+            }
+        }
+        if (image.dimension == RdnaImageDimension::Dim2D && storage && image.written && !image.read && !image.atomic && image.mipMode != ImageMipMode::DynamicStorage && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
+            auto line = mode;
+            line.dimension = RdnaImageDimension::Dim1D;
+            modes.push_back(line);
+        }
+        if (image.dimension == RdnaImageDimension::Dim2D && image.flatLineCompatible && !storage && !depth && conversion == IrBufferFormat::Invalid && packed == IrBufferFormat::Invalid) {
+            auto line = mode;
+            line.dimension = RdnaImageDimension::Dim1D;
+            modes.push_back(line);
+        }
+        if (image.dimension == RdnaImageDimension::Dim1D && !storage && !depth && conversion == IrBufferFormat::Invalid && packed == IrBufferFormat::Invalid) {
+            auto plane = mode;
+            plane.dimension = RdnaImageDimension::Dim2D;
+            modes.push_back(plane);
         }
         if (image.dimension == RdnaImageDimension::Dim1DArray || image.dimension == RdnaImageDimension::Dim2DArray || image.dimension == RdnaImageDimension::Dim2DMsaaArray) {
             auto plain = mode;
@@ -692,8 +734,15 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         mode.packedFormat = IrBufferFormat::Invalid;
         mode.shaderSwizzle = ShaderImageIdentitySwizzle;
         modes.push_back(mode);
+        if (image.dimension == RdnaImageDimension::Dim2DArray) {
+            auto plain = mode;
+            plain.dimension = RdnaImageDimension::Dim2D;
+            modes.push_back(plain);
+            mode.cube = true;
+            modes.push_back(mode);
+        }
     }
-    if (image.srgbDecodeFormats != 0u && image.srgbDecodeCompatible && !storage && !image.depthCompare && !image.packed) {
+    if (image.srgbDecodeFormats != 0u && image.srgbDecodeCompatible && !image.depthCompare && !storage && !image.packed) {
         const auto count = modes.size();
         for (std::size_t index = 0; index < count; ++index) {
             const auto& base = modes[index];
@@ -719,7 +768,19 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         }
     }
     if (modes.empty()) throw std::runtime_error("image instruction has no supported runtime modes");
+    if (image.foldTexelOffsetsOnly && std::ranges::any_of(modes, [](const ImageResource& mode) { return UnnormalizedSampleMismatch(mode) == nullptr; })) {
+        std::erase_if(modes, [](const ImageResource& mode) { return UnnormalizedSampleMismatch(mode) != nullptr; });
+    }
     return modes;
+}
+
+const char* ResourceMaterializer::UnnormalizedSampleMismatch(const ImageResource& image) {
+    if (image.indirectRoot != ImageResource::NoIndirectImage) return "samples an image selected at run time";
+    if (image.constantSwizzle) return nullptr;
+    if ((image.dimension != RdnaImageDimension::Dim1D && image.dimension != RdnaImageDimension::Dim2D) || image.cube) return "samples a 1D-array, 2D-array, 3D, cube or multisampled image";
+    if (image.depthCompare) return "is used with depth comparison";
+    if (image.conversionFormat != IrBufferFormat::Invalid || image.packed) return "samples an image that needs a format conversion or packed access";
+    return nullptr;
 }
 
 std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes) {
@@ -741,7 +802,7 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
             if (!exact) throw std::runtime_error(storage ? "runtime packed image bits are not reproducible through the view" : "runtime packed image bits are not recoverable from the view");
         }
     }
-    if (decoded.mipCount > (image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageHeapCapacity : 1u)) throw std::runtime_error("runtime storage image mip capacity exceeded");
+    if (decoded.mipCount > (image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageMipSlots : 1u)) throw std::runtime_error("runtime storage image mip capacity exceeded");
     if ((descriptorImageSwizzle(descriptor) & 06666u) == 0u && !decoded.fmask && !decoded.depthBits && decoded.conversionFormat == IrBufferFormat::Invalid && !decoded.srgbDecode) {
         for (std::uint32_t index = 0u; index < modes.size(); ++index) {
             if (modes[index].constantSwizzle && modes[index].numericClass == decoded.numericClass) return index;
@@ -749,6 +810,7 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
     }
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         const auto& mode = modes[index];
+        if (mode.constantSwizzle) continue;
         if (((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u) != emulated) continue;
         if (decoded.fmask) {
             if (mode.packedFormat == IrBufferFormat::Fmask8_S2_F1) return index;
@@ -757,7 +819,15 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         if (mode.numericClass == decoded.numericClass && mode.dimension == decoded.dimension && mode.conversionFormat == decoded.conversionFormat && mode.packedFormat == decoded.packedFormat && mode.cube == decoded.cube && mode.depthBits == decoded.depthBits && mode.depthUnorm16 == decoded.depthUnorm16 && mode.srgbDecode == decoded.srgbDecode) return index;
     }
     if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) throw std::runtime_error("image address has too few coordinate components");
-    throw std::runtime_error("image descriptor is incompatible with the static runtime image interface");
+    if (image.foldTexelOffsetsOnly) throw std::runtime_error("image sample with a texel offset that is not a constant takes only images an unnormalized S# can sample without VK_KHR_maintenance8 and shaderImageGatherExtended");
+    const auto describe = [](IrTextureNumericClass numeric, RdnaImageDimension dimension, IrBufferFormat conversion, IrBufferFormat packed, bool cube, bool depthBits, bool depthUnorm16, bool srgb) {
+        return "{class " + std::to_string(static_cast<int>(numeric)) + ", dim " + std::to_string(static_cast<int>(dimension)) + ", conversion " + std::to_string(static_cast<int>(conversion)) + ", packed " + std::to_string(static_cast<int>(packed)) + ", cube " + std::to_string(cube) + ", depthBits " + std::to_string(depthBits) + ", unorm16 " + std::to_string(depthUnorm16) + ", srgb " + std::to_string(srgb) + "}";
+    };
+    std::string message = "image descriptor is incompatible with the static runtime image interface: descriptor format " + std::to_string(static_cast<int>(format)) + " decodes to " + describe(decoded.numericClass, decoded.dimension, decoded.conversionFormat, decoded.packedFormat, decoded.cube, decoded.depthBits, decoded.depthUnorm16, decoded.srgbDecode) + (emulated ? " (emulated compare)" : "") + "; modes:";
+    for (const auto& mode : modes) message += " " + describe(mode.numericClass, mode.dimension, mode.conversionFormat, mode.packedFormat, mode.cube, mode.depthBits, mode.depthUnorm16, mode.srgbDecode);
+    char words[96];
+    std::snprintf(words, sizeof(words), "; T# %08x %08x %08x %08x %08x %08x %08x %08x", descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);
+    throw std::runtime_error(message + words);
 }
 
 std::uint32_t ResourceMaterializer::EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index) {
@@ -773,12 +843,17 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
             for (const auto* inst : block->Instructions()) {
                 if (inst->Opcode() != IrOpcode::ImageSampleRaw) continue;
                 const auto& memory = resources.memoryInfo.at(inst->Flags<MemoryFlags>().index);
-                if ((memory.imageSampleFlags & (RdnaImageSampleFlagCompare | RdnaImageSampleFlagOffset)) != (RdnaImageSampleFlagCompare | RdnaImageSampleFlagOffset)) continue;
+                if ((memory.imageSampleFlags & RdnaImageSampleFlagOffset) == 0u) continue;
                 const auto* address = inst->Argument(2)->Resolve();
                 const auto component = GetRdnaImageAddressComponentLayout(memory.imageSampleFlags, 0u);
                 const auto argument = component.bitOffset / 32u;
                 if (component.bitWidth == 32u && argument < address->ArgumentCount() && address->Argument(argument)->Resolve()->HasImmediate()) continue;
-                images.at(memory.resource).emulatedCompare |= EmulatedCompare::NativeOffsetUnsupported;
+                if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
+                    images.at(memory.resource).emulatedCompare |= EmulatedCompare::NativeOffsetUnsupported;
+                } else {
+                    images.at(memory.resource).foldTexelOffsetsOnly = true;
+                    resources.info.samplers.at(memory.sampler).foldTexelOffsetsOnly = true;
+                }
             }
         }
     }
@@ -790,7 +865,7 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
         image.srgbDecodeFormats = resources.srgbDecodeFormats;
         if (image.indirectRoot != ImageResource::NoIndirectImage) throw std::runtime_error("static image interface was already expanded");
         image.numericClass = image.atomic ? IrTextureNumericClass::Uint : IrTextureNumericClass::Float;
-        image.mipCount = image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageHeapCapacity : 1u;
+        image.mipCount = image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageMipSlots : 1u;
         if (resources.descriptorSources.at(image.source).indirectImage.has_value()) {
             if (images.size() + slots - 1u > ShaderInfo::MaxImages) throw std::runtime_error("static bindless image capacity exceeded");
             image.indirectRoot = index;
@@ -963,7 +1038,7 @@ std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {
 }
 
 std::uint32_t ResourceMaterializer::BindlessSlots() {
-    return RuntimeAbi::SampledHeapCapacity;
+    return RuntimeAbi::BindlessTableSlots;
 }
 
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {

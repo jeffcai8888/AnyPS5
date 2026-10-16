@@ -30,6 +30,16 @@ std::int32_t APS5_VABI scePsmlMfsrGetDispatchMfsrPacket1100(void* context, void*
  return SCE_PSML_ERROR_NOT_INITIALIZED;
 }
 
+int APS5_VABI scePsmlMfsrCreateContext1300() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI scePsmlMfsrGetDispatchMfsrPacket1300() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 int APS5_VABI scePsmlMfsrGetSharedResourcesInitRequirement() {
  NotImplemented_nid_no_patch(__func__);
  return 0;
@@ -71,6 +81,11 @@ int APS5_VABI scePsmlMfsrReleaseContext() {
 }
 
 int APS5_VABI scePsmlMfsrIsCaptureInProgress() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI scePsmlMfsrGetDispatchMfsrPacket1000() {
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }
@@ -137,6 +152,18 @@ int APS5_VABI scePsmlMfsr2CreateContext() {
 
 int APS5_VABI scePsmlMfsr2Init() {
     NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+APS5_EXPORT("xNZM9Y5lf-M", scePsmlUnknown01);
+int APS5_VABI scePsmlUnknown01(void) {
+    NotImplemented_nid_no_patch("xNZM9Y5lf-M");
+    return 0;
+}
+
+APS5_EXPORT("lcZD9tJraAw", scePsmlUnknown02);
+int APS5_VABI scePsmlUnknown02(void) {
+    NotImplemented_nid_no_patch("lcZD9tJraAw");
     return 0;
 }
 

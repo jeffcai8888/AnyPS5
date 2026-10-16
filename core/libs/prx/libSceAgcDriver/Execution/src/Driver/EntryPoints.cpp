@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include <mutex>
 
@@ -53,6 +54,10 @@ void ReportFailure(std::exception_ptr error) {
     DriverDetail::Driver::Get().ReportFailure(error);
 }
 
+}
+
+extern "C" void AgcDriverRaiseWorkerThreadPriority_nid_postfix(const char* role) {
+    AgcDriver::RaiseWorkerThreadPriority(role);
 }
 
 extern "C" void AgcDriverWaitIdle_nid_postfix() try {
@@ -118,13 +123,19 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
     AgcDriver::ReportFailure(error);
 }
 
-extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
-extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
+extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
-extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }

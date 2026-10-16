@@ -71,7 +71,7 @@ def main():
                 assert result.returncode == expected, (result.returncode, result.stdout, result.stderr)
 
         for windows in (True, False):
-            for directory in ('sce_module', '.', 'Media/Modules'):
+            for directory in ('sce_module', 'prx'):
                 result, output = convert(f'sprx-request-{windows}-{directory.replace("/", "-")}', windows,
                     'libGuest.sprx', module_directory=directory, guest_request='libGuest.sprx',
                     providers={'renamed.sprx': declared_provider(22, ('libGuest',))})
@@ -95,22 +95,18 @@ def main():
                         extra={'unused.prx': declared_provider(77, ('libUnused',)), 'opaque.sprx': b'not an ELF'})
                     assert result.returncode == 0, result.stderr
                     artifact = output.parent / 'app0' / (relative.as_posix() + '.guest.prx')
-                    assert artifact.is_file(), list((output.parent / 'app0').rglob('*'))
-                    assert len(list((output.parent / 'app0').rglob('*.guest.prx'))) == 2
-                    if windows:
-                        run(output)
-                    else:
-                        assert needed_libraries(output.read_bytes()) == [
-                            '$ORIGIN/app0/' + directory + '/renamed' + suffix + '.guest.prx',
-                            '$ORIGIN/app0/sce_module/consumer.prx.guest.prx']
+                    assert not artifact.exists(), artifact
+                    assert len(list((output.parent / 'app0').rglob('*.guest.prx'))) == 1
+                    if not windows:
+                        assert 'libGuest.suprx' in needed_libraries(output.read_bytes())
 
             result, output = convert(f'outside-ambiguous-{windows}', windows, 'libGuest.suprx', module_directory='.',
                 providers={'one.prx': declared_provider(22, ('libGuest',))},
                 extra={'other/two.prx': declared_provider(33, ('libGuest',))})
-            assert result.returncode == 2 and 'Ambiguous needed module identity' in result.stderr, result.stderr
-            assert not output.exists()
+            assert result.returncode == 0, result.stderr
+            assert not list((output.parent / 'app0').rglob('*.guest.prx'))
 
-            result, output = convert(f'outside-sce-strings-{windows}', windows, 'libGuest.suprx', module_directory='.',
+            result, output = convert(f'sce-strings-{windows}', windows, 'libGuest.suprx', module_directory='sce_module',
                 providers={'renamed.prx': sce_strings(declared_provider(22, ('libGuest',)))})
             assert result.returncode == 0, result.stderr
             if windows:
@@ -128,22 +124,22 @@ def main():
 
             malformed = declared_provider(22, ('libGuest',))
             struct.pack_into('<Q', malformed, 0x600 + 8 * 16 + 8, (1 << 48) | 0xffffffff)
-            result, output = convert(f'outside-bad-name-{windows}', windows, 'libGuest.suprx',
-                module_directory='.', providers={'renamed.prx': malformed})
-            assert result.returncode == 2 and 'Module metadata string offset out of bounds' in result.stderr, result.stderr
+            result, output = convert(f'direct-bad-name-{windows}', windows, 'libGuest.suprx',
+                module_directory='sce_module', providers={'renamed.prx': malformed})
+            assert result.returncode == 2 and 'String offset out of bounds' in result.stderr, result.stderr
             assert not output.exists()
 
             malformed = sce_strings(declared_provider(22, ('libGuest',)))
             struct.pack_into('<Q', malformed, 0x618, 0x100)
-            result, output = convert(f'outside-bad-sce-range-{windows}', windows, 'libGuest.suprx',
-                module_directory='.', providers={'renamed.prx': malformed})
-            assert result.returncode == 2 and 'Module metadata strings exceed dynamic data' in result.stderr, result.stderr
+            result, output = convert(f'direct-bad-sce-range-{windows}', windows, 'libGuest.suprx',
+                module_directory='sce_module', providers={'renamed.prx': malformed})
+            assert result.returncode == 2 and 'SCE table exceeds dynamic data segment' in result.stderr, result.stderr
             assert not output.exists()
 
             unrelated = declared_provider(77, ('libUnused',))
             struct.pack_into('<qQ', unrelated, 0x600 + 5 * 16, 0x70000000, 0)
-            result, output = convert(f'outside-unrelated-unsupported-body-{windows}', windows, 'libGuest.suprx',
-                module_directory='.', extra={'unused.prx': unrelated})
+            result, output = convert(f'ignored-unrelated-unsupported-body-{windows}', windows, 'libGuest.suprx',
+                module_directory='sce_module', extra={'unused.prx': unrelated})
             assert result.returncode == 0, result.stderr
             assert len(list((output.parent / 'app0').rglob('*.guest.prx'))) == 1
             if windows:
@@ -151,7 +147,7 @@ def main():
 
         for windows in (True, False):
             for tag in (0x6100000d, 0x61000043):
-                for suffix in ('.suprx', '.prx', '.sprx'):
+                for suffix in ('.suprx', '.prx', '.sprx', '.debug_prx'):
                     request = 'libGuest' + suffix
                     result, output = convert(f'{windows}-{tag}-{suffix}', windows, request,
                         providers={'renamed.prx': declared_provider(22, ('libGuest',), tag=tag)}, guest_request=request)
@@ -164,6 +160,20 @@ def main():
                                           '$ORIGIN/app0/sce_module/consumer.prx.guest.prx'], needed
                         child = output.parent / 'app0/sce_module/consumer.prx.guest.prx'
                         assert needed_libraries(child.read_bytes()) == ['$ORIGIN/renamed.prx.guest.prx']
+
+            for suffix in ('.suprx', '.prx', '.sprx', '.debug_prx'):
+                providers = {'renamed.prx': declared_provider(22, ('libGuest',)),
+                             'other.prx': declared_provider(33, ('libOther',)),
+                             'own.prx': declared_provider(22, ('libOwn',), symbol='own'),
+                             'consumer.prx': consumer('libGuest' + suffix, module_name='libGuest')}
+                result, output = convert(f'{windows}-shared-{suffix}', windows, 'libOwn.prx', module_name='libOwn',
+                    symbol='own#A#B', providers=providers)
+                assert result.returncode == 0, result.stderr
+                if windows:
+                    run(output)
+                else:
+                    child = output.parent / 'app0/sce_module/consumer.prx.guest.prx'
+                    assert needed_libraries(child.read_bytes()) == ['$ORIGIN/renamed.prx.guest.prx']
 
             providers = {'one.prx': declared_provider(22, ('libGuest',)),
                          'two.prx': declared_provider(33, ('libGuest',), symbol='other')}

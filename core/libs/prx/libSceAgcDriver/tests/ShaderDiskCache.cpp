@@ -23,6 +23,15 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -41,7 +50,7 @@ void setEnvironment(const char* name, const std::string& value) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.samplerUnnormalized == right.samplerUnnormalized && left.imageUnnormalized == right.imageUnnormalized && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -62,6 +71,7 @@ void requireSameArtifact(const CompiledShaderArtifact& left, const CompiledShade
     require(left.hostSubgroupSize == right.hostSubgroupSize, prefix + "host subgroup size differs");
     require(left.vertexInputs == right.vertexInputs, prefix + "vertex inputs differ");
     require(left.vertexInputPatches == right.vertexInputPatches, prefix + "vertex type patches differ");
+    require(left.registrationModule == right.registrationModule, prefix + "registration module flags differ");
     require(left.vertexOffsetSgpr == right.vertexOffsetSgpr && left.instanceOffsetSgpr == right.instanceOffsetSgpr, prefix + "offset SGPRs differ");
     require(left.vertexOffsetShared == right.vertexOffsetShared && left.instanceOffsetShared == right.instanceOffsetShared && left.vertexOffsetConflict == right.vertexOffsetConflict && left.instanceOffsetConflict == right.instanceOffsetConflict, prefix + "offset flags differ");
     require(left.parameterExports == right.parameterExports, prefix + "parameter exports differ");
@@ -79,6 +89,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(sameBindings(left.bindings, right.bindings), prefix + "bindings differ");
     require(left.pushConstants == right.pushConstants, prefix + "push constants differ");
     require(left.specialization == right.specialization, prefix + "specialization constants differ");
+    require(left.workgroupMemoryDwords == right.workgroupMemoryDwords, prefix + "workgroup memory stride differs");
     require(left.poisonedSrtReads == right.poisonedSrtReads, prefix + "poisoned SRT read counts differ");
     require(left.vertexAttributes.size() == right.vertexAttributes.size(), prefix + "vertex attribute count differs");
     for (std::size_t i = 0; i < left.vertexAttributes.size(); ++i) {
@@ -86,6 +97,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
         const auto& b = right.vertexAttributes[i];
         require(a.location == b.location && a.components == b.components && a.resource.fields == b.resource.fields && a.fetchIndex == b.fetchIndex && a.formatComponents == b.formatComponents, prefix + "vertex attribute differs");
     }
+    require(left.barycentricEmulation.active == right.barycentricEmulation.active && left.barycentricEmulation.smooth == right.barycentricEmulation.smooth && left.barycentricEmulation.linear == right.barycentricEmulation.linear, prefix + "barycentric emulation differs");
 }
 
 void requireSameVariant(const CompiledVariant& left, const CompiledVariant& right, const char* what) {
@@ -117,8 +129,11 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.bufferAtomic = {true};
     binding.bufferWritten = {false, false, true, true, false};
     binding.samplerUnnormalized = {false, true, true};
+    binding.samplerIntegerBorder = {true, false, seed % 2 == 1};
     binding.imageUnnormalized = {true, false, seed % 2 == 0};
+    binding.imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
     binding.imageSamplers = {0x5u, 0u, 0x80000000u};
+    binding.bufferRead = {true, false, false, true, true, false};
     return binding;
 }
 
@@ -136,8 +151,10 @@ RecompileResult sampleResult() {
     result.bdaAbiVersion = 3;
     result.memoryOffsetDword = 7;
     result.hostSubgroupSize = 32;
+    result.workgroupMemoryDwords = 32769u;
     result.vertexInputs = {{1, 4, 2}, {5, 2, 0}};
     result.vertexInputPatches = {{1, 20, {7, 8, 9}}, {5, 40, {10, 11, 12}}};
+    result.registrationModule = true;
     result.specialization = {{512, 4}, {516, 0x3f800000u}, {517, 0}};
     result.vertexAttributes = {{1, 4, {{0x1000u, 0x20000u, 0x30u, 0x4u}}, 2}, {5, 2, {{9u, 8u, 7u, 6u}}, 0}};
     result.vertexInputs[0].outputMask = 5u;
@@ -151,6 +168,7 @@ RecompileResult sampleResult() {
     result.parameterExports = {0, 3, 7};
     result.fragmentParameters = {{0, 1, true, false, true}, {2, 3, false, true}};
     result.poisonedSrtReads = 3;
+    result.barycentricEmulation = {true, false, true};
     result.variantId = 99;
     return result;
 }
@@ -195,6 +213,11 @@ CompiledVariant sampleVariant() {
     image.r128 = true;
     image.fmaskCompatible = false;
     image.depthBitsCompatible = false;
+    image.constantSwizzle = true;
+    image.constantSwizzleCompatible = false;
+    image.flatVolumeCompatible = false;
+    image.flatLineCompatible = false;
+    image.foldTexelOffsetsOnly = true;
     image.byElements = 4;
     image.byComponents = 1;
     image.indirectRoot = 0;
@@ -203,7 +226,7 @@ CompiledVariant sampleVariant() {
     image.indirectResources = {1, 2, 3};
     info.info.images = {image};
     ResourceMaterializer::PrepareImageModes(info.info);
-    info.info.samplers = {{7, 0x10, 3, true, false, SamplerUseExplicitLod | SamplerUseGather}};
+    info.info.samplers = {{7, 0x10, 3, true, false, SamplerUseExplicitLod | SamplerUseGather, true}};
     info.info.sampledPairs = {{0, 0, 0x10}};
     StageInput input{};
     input.kind = StageInputKind::GlobalInvocationId;
@@ -223,6 +246,7 @@ CompiledVariant sampleVariant() {
     info.info.hasBitwiseXor = true;
     info.info.usesDma = true;
     info.info.usesFaultBuffer = true;
+    info.info.rasterPrimitive = true;
     info.bindings.pushDataStartDword = 2;
     info.bindings.memoryOffsetDword = 1;
     info.bindings.memoryOffsetCount = 5;
@@ -390,6 +414,7 @@ void verifyKeySensitivity() {
     changes("non-constant texel offsets", [](SampleRequest& sample) { sample.request.target.nonConstantImageOffsets = true; });
     changes("the sRGB formats decoded in the shader", [](SampleRequest& sample) { sample.request.target.srgbDecodeFormats = 2u; });
     changes("the narrow subgroup clock", [](SampleRequest& sample) { sample.request.target.narrowSubgroupClock = true; });
+    changes("f64 denormal preservation", [](SampleRequest& sample) { sample.request.target.float64DenormPreserve = true; });
     changes("the workgroup size limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSize[2] = 128; });
     changes("the invocation limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupInvocations = 512; });
     changes("the shared memory limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSharedMemoryBytes = 32768; });
@@ -472,6 +497,63 @@ void verifyFloatModeSerialization() {
     sample.request.context.floatMode = mode;
     const auto back = serializer.Deserialize(serializer.Serialize(sample.request));
     require(back.request.context.floatMode == mode, "the float mode did not survive serialization");
+}
+
+void verifyAtomicReplacement(const std::filesystem::path& directory) {
+    struct Reader {
+#ifdef _WIN32
+        HANDLE file;
+        explicit Reader(const std::filesystem::path& path)
+            : file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)) {
+            require(file != INVALID_HANDLE_VALUE, "cannot retain the cache file");
+        }
+        ~Reader() { CloseHandle(file); }
+        std::vector<std::byte> Read() {
+            require(SetFilePointerEx(file, {}, nullptr, FILE_BEGIN), "cannot seek the retained cache file");
+            std::array<std::byte, 32> bytes{};
+            DWORD count = 0;
+            require(ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr), "cannot read the retained cache file");
+            return {bytes.begin(), bytes.begin() + count};
+        }
+#else
+        std::ifstream file;
+        explicit Reader(const std::filesystem::path& path) : file(path, std::ios::binary) {
+            require(file.is_open(), "cannot retain the cache file");
+        }
+        std::vector<std::byte> Read() {
+            file.clear();
+            file.seekg(0);
+            require(!file.fail(), "cannot seek the retained cache file");
+            std::array<std::byte, 32> bytes{};
+            file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+            require(file.eof() && !file.bad(), "cannot read the retained cache file");
+            return {bytes.begin(), bytes.begin() + file.gcount()};
+        }
+#endif
+        Reader(const Reader&) = delete;
+        Reader& operator=(const Reader&) = delete;
+    };
+    const auto root = directory / "atomic-replacement";
+    const auto path = root / "entry.bin";
+    const std::vector<std::byte> original{std::byte{0x12}, std::byte{0x00}, std::byte{0x34}};
+    const std::vector<std::byte> replacement{std::byte{0xab}, std::byte{0xcd}, std::byte{0x00}, std::byte{0xef}};
+    require(WriteFileAtomically(path, original), "cannot write the initial cache entry");
+    {
+        Reader old(path);
+        require(old.Read() == original, "the retained reader did not read the original entry");
+        require(WriteFileAtomically(path, replacement), "cannot replace cache entry with a retained reader");
+        require(old.Read() == original, "replacement changed the retained original entry");
+        std::vector<std::byte> fresh;
+        require(ReadWholeFile(path, fresh) && fresh == replacement, "a fresh reader did not read the replacement entry");
+        Reader current(path);
+        require(current.Read() == replacement, "the replacement reader did not retain its entry");
+        require(std::filesystem::remove(path), "cannot delete the replacement while readers retain it");
+        require(!ReadWholeFile(path, fresh), "the deleted cache entry remains readable by path");
+        require(old.Read() == original && current.Read() == replacement, "deletion invalidated retained cache readers");
+    }
+    require(std::filesystem::is_empty(root), "atomic replacement left a temporary file behind");
+    require(std::filesystem::remove(root), "cannot remove the empty replacement directory");
 }
 
 void verifyStore() {
@@ -749,7 +831,7 @@ void verifyBindingPlanSelection() {
     BindingAllocationResult full;
     builder.Populate(full, compiled, plan, 0u, snapshot, {});
     require(full.bindings.size() == 4u, "binding plan lost a descriptor before module selection");
-    require(full.bindings[0].bufferAtomic == std::vector<bool>{true, false} && full.bindings[0].bufferWritten == std::vector<bool>{true, false}, "binding plan lost buffer access metadata");
+    require(full.bindings[0].bufferAtomic == std::vector<bool>{true, false} && full.bindings[0].bufferWritten == std::vector<bool>{true, false} && full.bindings[0].bufferRead == std::vector<bool>{false, true}, "binding plan lost buffer access metadata");
     const std::array liveBindings{full.bindings[0].binding, full.bindings[0].binding, full.bindings[3].binding};
     const auto selected = builder.Select(plan, liveBindings);
     snapshot.userData.clear();
@@ -1021,6 +1103,7 @@ int main(int argc, char** argv) {
         verifyDefaultDirectory(argv[0]);
         setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
         setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
+        verifyAtomicReplacement(directory);
         verifyResultRoundTrip();
         verifyEntryRoundTrip();
         verifyArtifactStorageIsolation();

@@ -8,6 +8,11 @@
 
 namespace Codegen {
 
+enum class Amd64OnlyTarget : std::uint8_t {
+    Intel,
+    Rosetta
+};
+
 enum class Amd64OnlyLowering : std::uint8_t {
     InPlace,
     Trampoline,
@@ -30,6 +35,7 @@ struct Amd64OnlyMatch {
     std::size_t ReturnBranchOffset;
     bool Optional = false;
     std::vector<StubRelocation> Relocations = {};
+    bool RelocatableWindow = false;
 };
 
 struct Amd64OnlySubstitutionReport {

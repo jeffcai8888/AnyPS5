@@ -1,12 +1,19 @@
 #include "VulkanTestDevice.hpp"
+#include "SceShaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <array>
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <chrono>
 #include <future>
+#include <cstring>
 #include <iostream>
+#include <latch>
+#include <optional>
+#include <semaphore>
 #include <thread>
 
 namespace {
@@ -106,6 +113,93 @@ void Transactions() {
     Require(!partial && front.prepared->entries.size() == 200 && pixel->prepared->entries.size() == 200, "concurrent group publication was partial or lost an update");
 }
 
+void HeaderSelection() {
+    const auto makeSnapshot = [](std::uint64_t headerAddress, std::uint8_t type) {
+        auto snapshot = std::make_shared<ShaderSnapshot>();
+        snapshot->codeAddress = 0x10000;
+        snapshot->headerAddress = headerAddress;
+        snapshot->type = type;
+        snapshot->code = {0xbf810000u};
+        Shader header{};
+        header.code = reinterpret_cast<const void*>(snapshot->codeAddress);
+        header.type = type;
+        snapshot->header.resize(sizeof(Shader));
+        std::memcpy(snapshot->header.data(), &header, sizeof(Shader));
+        return snapshot;
+    };
+    const auto vertex = makeSnapshot(0x20000, 2);
+    const auto compute = makeSnapshot(0x30000, 0);
+    std::shared_ptr<ShaderRegistry> registry;
+    PublishRegisteredShader(registry, vertex);
+    PublishRegisteredShader(registry, compute);
+    Require(RegisteredProgram(*registry, 0x10000, {2}) == vertex && RegisteredProgram(*registry, 0x10000, {0}) == compute, "shared code selected another registered type");
+    Reject([&] { static_cast<void>(RegisteredProgram(*registry, 0x10000, {1})); });
+    Require(RegisteredProgram(*registry, 0x10100, {2}) == nullptr, "an out-of-range entry selected registered code");
+    const auto copy = makeSnapshot(0x40000, 2);
+    PublishRegisteredShader(registry, copy);
+    Require(RegisteredProgram(*registry, 0x10000, {2}) == copy, "equivalent registered headers became ambiguous");
+    PublishRegisteredShader(registry, makeSnapshot(vertex->headerAddress, 2));
+    Require(RegisteredProgram(*registry, 0x10000, {2}) == vertex && registry->at(0x10000).size() == 3, "identical earlier registration did not restore its prepared snapshot as current");
+    const auto replacement = makeSnapshot(copy->headerAddress, 2);
+    Shader changed;
+    std::memcpy(&changed, replacement->header.data(), sizeof(Shader));
+    changed.target = 1;
+    std::memcpy(replacement->header.data(), &changed, sizeof(Shader));
+    PublishRegisteredShader(registry, replacement);
+    Require(RegisteredProgram(*registry, 0x10000, {2}) == replacement, "same-type registration did not keep the latest program metadata");
+    const auto geometry = makeSnapshot(0x60000, 4);
+    PublishRegisteredShader(registry, geometry);
+    Reject([&] { static_cast<void>(RegisteredProgram(*registry, 0x10000, {2, 4})); });
+}
+
+void FusedHullHeaderSelection() {
+    struct Hull {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{{{0x100, 0x11}, {0x108, 0x100}, {0x109, 0}, {0x10a, 0x2}, {0x10b, 0x10}, {0x148, 0}, {0x149, 0}}};
+        ShaderSpecialRegs specials{};
+    } back;
+    back.shader.file_header = 0x34333231u;
+    back.shader.version = 0x18;
+    back.shader.header_size = sizeof(Hull);
+    back.shader.shader_size = 4;
+    back.shader.code = reinterpret_cast<const void*>(std::uintptr_t{0x50000});
+    back.shader.type = 7;
+    back.shader.sh_registers = back.registers.data();
+    back.shader.num_sh_registers = back.registers.size();
+    back.shader.specials = &back.specials;
+    auto snapshot = std::make_shared<ShaderSnapshot>();
+    snapshot->codeAddress = 0x50000;
+    snapshot->headerAddress = reinterpret_cast<std::uintptr_t>(&back);
+    snapshot->type = 7;
+    snapshot->code = {0xbf810000u};
+    snapshot->header.resize(sizeof(Hull));
+    std::memcpy(snapshot->header.data(), &back, sizeof(Hull));
+    std::shared_ptr<ShaderRegistry> registry;
+    PublishRegisteredShader(registry, snapshot);
+    auto registers = back.registers;
+    registers[0].value = 0x22;
+    registers[3].value = 0x3;
+    registers[4].value = 0x1e;
+    registers[5].value = 0x600;
+    registers[6].value = 0x1;
+    Shader fused = back.shader;
+    fused.type = 3;
+    fused.sh_registers = registers.data();
+    fused.user_data = nullptr;
+    Require(RegisteredHeader(*registry, &fused) == snapshot, "a fused hull header did not select its registered back half");
+    registers[1].value = 0x200;
+    Require(RegisteredHeader(*registry, &fused) == nullptr, "a fused hull header with another hull program selected the back half");
+    registers[1].value = 0x100;
+    registers[2].offset = 0x10c;
+    Require(RegisteredHeader(*registry, &fused) == nullptr, "a fused hull header with other registers selected the back half");
+    registers[2].offset = 0x109;
+    fused.target ^= 1u;
+    Require(RegisteredHeader(*registry, &fused) == nullptr, "a fused hull header with another target selected the back half");
+    fused.target ^= 1u;
+    fused.type = 2;
+    Require(RegisteredHeader(*registry, &fused) == nullptr, "a vertex header selected a registered hull back half");
+}
+
 void Registration(AgcDriver::VulkanDevice& device) {
     const std::array<std::uint32_t, 1> code{0xbf810000u};
     RecompileRequest request{{ShaderStage::Compute, 0x10000, code, 0, {}}, {32, 0, {}, ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 0, {}}, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
@@ -130,7 +224,7 @@ void Registration(AgcDriver::VulkanDevice& device) {
             for (unsigned iteration = 0; iteration < 40; ++iteration) {
                 ShaderPreparationTransaction transaction;
                 PublishRegisteredShader(registry, makeSnapshot());
-                const auto current = registry->at(0x10000);
+                const auto current = registry->at(0x10000).back();
                 Require(current == original && current->prepared->rectangleRequested, "identical registration replaced a prepared snapshot");
                 auto& entries = transaction.Edit(*current).entries;
                 entries.push_back({iteration + 1, handle});
@@ -160,11 +254,11 @@ void Registration(AgcDriver::VulkanDevice& device) {
         transaction.Commit();
     }
     replacementWriter.get();
-    Require(registry->at(0x10000) == replacement && submission->at(0x10000) == original, "replacement modified an in-flight registry");
+    Require(registry->at(0x10000).back() == replacement && submission->at(0x10000).back() == original, "replacement modified an in-flight registry");
     Require(original->prepared->entries.size() == 162 && replacement->prepared->entries.empty(), "stale preparation was published into a replacement snapshot");
     original.reset();
-    request.shader.code = submission->at(0x10000)->code;
-    const auto invocation = InvocationFor(*submission->at(0x10000), 0, request);
+    request.shader.code = submission->at(0x10000).back()->code;
+    const auto invocation = InvocationFor(*submission->at(0x10000).back(), 0, request);
     const auto capture = invocation.Capture({});
     const auto result = invocation.Materialize(*capture);
     Require(result->variantId == GetPreparedArtifact(*handle).variantId, "old submission lost its prepared artifact");
@@ -172,19 +266,76 @@ void Registration(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
     Require(!old.expired(), "in-flight submission released its snapshot early");
     submission.reset();
-    Require(old.expired(), "completed submission retained an obsolete snapshot");
+    Require(!old.expired() && registry->at(0x10000).size() == 2, "registration discarded an earlier header for shared code");
     Require(invocation.Materialize(*capture)->spirv.data() == result->spirv.data(), "prepared handle did not retain its artifact");
     auto changed = makeSnapshot();
     changed->headerAddress = replacement->headerAddress;
     changed->code[0] ^= 1;
     PublishRegisteredShader(registry, changed);
-    Require(registry->at(0x10000) == changed, "changed shader code was treated as identical");
+    Require(registry->at(0x10000).back() == changed && registry->at(0x10000).size() == 1 && old.expired(), "changed shader code retained obsolete headers");
     auto metadata = makeSnapshot();
     metadata->headerAddress = changed->headerAddress;
     metadata->code = changed->code;
     metadata->header.push_back(std::byte{1});
     PublishRegisteredShader(registry, metadata);
-    Require(registry->at(0x10000) == metadata, "changed shader metadata was treated as identical");
+    Require(registry->at(0x10000).back() == metadata, "changed shader metadata was treated as identical");
+}
+
+void TransactionLock() {
+    ShaderSnapshot shader{};
+    const auto publish = [&] {
+        ShaderPreparationTransaction other;
+        other.Edit(shader).rectangleRequested = true;
+        other.Commit();
+    };
+    std::optional<ShaderPreparationTransaction> open(std::in_place);
+    auto unread = std::async(std::launch::async, publish);
+    const bool unblocked = unread.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    if (!unblocked) open.reset();
+    unread.get();
+    Require(unblocked, "an open transaction that read nothing blocked another one");
+    static_cast<void>(open->Read(shader));
+    auto waiting = std::async(std::launch::async, publish);
+    const bool excluded = waiting.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout;
+    open->Commit();
+    open.reset();
+    waiting.get();
+    Require(excluded, "a transaction ran beside one that had read prepared state");
+}
+
+void PreparationPriority(bool beforeSubmit) {
+    const auto workers = std::max(2u, std::thread::hardware_concurrency() / 2u);
+    std::barrier started(static_cast<std::ptrdiff_t>(workers + 1u));
+    std::counting_semaphore<> release(0);
+    std::latch finished(static_cast<std::ptrdiff_t>(workers));
+    for (unsigned index = 0; index < workers; ++index) {
+        SubmitRegistrationPreparation([&] {
+            started.arrive_and_wait();
+            release.acquire();
+            finished.count_down();
+        });
+    }
+    started.arrive_and_wait();
+    PreparedShaders prepared;
+    std::atomic<unsigned> order{0};
+    std::promise<unsigned> background;
+    std::promise<unsigned> demanded;
+    auto backgroundDone = background.get_future();
+    auto demandedDone = demanded.get_future();
+    SubmitRegistrationPreparation([&] { background.set_value(order.fetch_add(1u)); });
+    if (beforeSubmit) PrioritizeRegistrationPreparation(prepared);
+    SubmitRegistrationPreparation([&] { demanded.set_value(order.fetch_add(1u)); }, &prepared);
+    if (!beforeSubmit) {
+        PrioritizeRegistrationPreparation(prepared);
+        PrioritizeRegistrationPreparation(prepared);
+    }
+    release.release();
+    const bool settled = demandedDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    const bool backgroundSettled = backgroundDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release.release(static_cast<std::ptrdiff_t>(workers - 1u));
+    finished.wait();
+    Require(settled && backgroundSettled, "preparation queue did not complete its work");
+    Require(demandedDone.get() == 0u && backgroundDone.get() == 1u && order.load() == 2u, "demanded preparation waited behind background work or ran twice");
 }
 
 }
@@ -192,6 +343,11 @@ void Registration(AgcDriver::VulkanDevice& device) {
 int main() {
     try {
         Transactions();
+        HeaderSelection();
+        FusedHullHeaderSelection();
+        TransactionLock();
+        PreparationPriority(false);
+        PreparationPriority(true);
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Registration(*device);

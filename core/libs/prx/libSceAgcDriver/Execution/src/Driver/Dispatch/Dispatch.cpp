@@ -5,7 +5,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -14,13 +16,8 @@ namespace AgcDriver::DriverDetail {
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
-    auto it = submission.shaders->upper_bound(address);
-    std::shared_ptr<const ShaderSnapshot> registeredShader;
-    if (it != submission.shaders->begin()) {
-        --it;
-        if (address - it->second->codeAddress < it->second->code.size() * sizeof(std::uint32_t)) registeredShader = it->second;
-    }
-    if (!registeredShader) registeredShader = ReadRawComputeShader(address);
+    auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
+    if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
@@ -29,6 +26,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         userData.push_back(readUserData(queue.shader, 0x240 + i));
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
+    const bool resolving = resolvingAhead();
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
 
@@ -42,7 +40,23 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     std::array<std::uint32_t, 5> resolved{};
-    if (indirectArguments != 0 && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
+    ResolvedDispatch ahead;
+    bool fromAhead = false;
+    auto& groupStats = groupCaptureStats();
+    if (!resolving) {
+        auto& parked = resolvedAhead();
+        if (const auto found = parked.find(currentPacketOffset()); found != parked.end()) {
+            ahead = std::move(found->second);
+            parked.erase(found);
+            fromAhead = ahead.address == address;
+            if (!fromAhead) ++groupStats.addressMismatches;
+        }
+    }
+    if (fromAhead) {
+        resolved = ahead.packet;
+        packet = resolved;
+        indirectArguments = ahead.indirectArguments;
+    } else if (indirectArguments != 0 && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
 
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
@@ -51,13 +65,27 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         packet = resolved;
         indirectArguments = 0;
     }
-    if (fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
-        pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
-        return;
+    std::array<std::uint32_t, 3> partialGroups{};
+    if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) {
+        partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)});
     }
-    if (indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
-        pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
-        return;
+    const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
+    if (resolving) {
+        if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
+        if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
+    } else {
+        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
+            if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
+        }
+        if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
+            pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
+            return;
+        }
+        if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
+            pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
+            return;
+        }
     }
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
         const std::array<std::uint32_t, 3> threads{packet[1], packet[2], packet[3]};
@@ -65,6 +93,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (threads[axis] % compute.numThreads[axis] != 0) compute.partialThreads = threads;
         }
     }
+    if (partialLastGroup) compute.partialThreads = partialGroups;
     ShaderRecompiler::RecompileRequest request{
         {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
         {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, RegisteredFloatMode(snapshot)},
@@ -180,14 +209,36 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    if (fromAhead && key != ahead.key) {
+        fromAhead = false;
+        ++groupStats.keyMismatches;
+    }
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
-    lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+    if (fromAhead) {
+        compiledResult = std::move(ahead.compiledResult);
+        keepVariant = std::move(ahead.keepVariant);
+        attachVariant = std::move(ahead.attachVariant);
+        shaderMemory = std::move(ahead.shaderMemory);
+        captured = std::move(ahead.captured);
+        liveWords = std::move(ahead.liveWords);
+        capture = std::move(ahead.capture);
+        dataHit = ahead.dataHit;
+        cached = ahead.cached;
+        validated = ahead.validated;
+        ++groupStats.adopted;
+        const auto age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ahead.resolvedAt).count();
+        groupStats.ageMs += age;
+        groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
+        phaseTiming.Phase(PhaseLookup);
+    } else {
+        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+    }
     timing.Mark("lookup_cache");
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
-    } else {
+    } else if (!fromAhead) {
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
         std::uint64_t forgetAtCapture = 0;
 
@@ -233,6 +284,29 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseRecompile);
         insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     }
+    if (resolving) {
+        auto& parked = resolvedAhead()[currentPacketOffset()];
+        parked = ResolvedDispatch{};
+        parked.address = address;
+        parked.key = key;
+        parked.indirectArguments = indirectArguments;
+        std::copy_n(packet.begin(), std::min(packet.size(), parked.packet.size()), parked.packet.begin());
+        parked.registeredShader = registeredShader;
+        parked.compiledResult = compiledResult;
+        parked.keepVariant = keepVariant;
+        parked.attachVariant = attachVariant;
+        parked.shaderMemory = shaderMemory;
+        parked.captured = captured;
+        parked.liveWords = liveWords;
+        parked.capture = capture;
+        parked.dataHit = dataHit;
+        parked.cached = cached;
+        parked.validated = validated;
+        parked.resolvedAt = std::chrono::steady_clock::now();
+        ++groupStats.resolved;
+        if (cached) ++groupStats.resolvedHits;
+        return;
+    }
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
@@ -251,6 +325,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             groups[axis] = (groups[axis] + threads - 1) / threads;
         }
     }
+    const std::uint64_t dispatchThreads = indirectArguments != 0 ? 0 : std::uint64_t{groups[0]} * groups[1] * groups[2] * compute.numThreads[0] * compute.numThreads[1] * compute.numThreads[2];
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
     if (traceIo) {
 
@@ -266,6 +341,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     const auto rethrow = [&](const std::exception& error) {
+        if (fromAhead) {
+            ++groupStats.deviceRejects;
+            dispatch(queue, packet, submission, indirectArguments);
+            return true;
+        }
         char where[64];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
         throw std::runtime_error(where + std::string(error.what()));
@@ -288,9 +368,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
-                prepared = localDevice->PrepareDispatch(compiled, snapshots);
+                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads);
             } catch (const std::exception& error) {
-                rethrow(error);
+                if (rethrow(error)) return;
             }
             if (profile) {
                 const auto now = std::chrono::steady_clock::now();
@@ -338,7 +418,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
             }
         } catch (const std::exception& error) {
-            rethrow(error);
+            if (rethrow(error)) return;
         }
         if (builtRecipe != nullptr) {
             if (dataHit) {

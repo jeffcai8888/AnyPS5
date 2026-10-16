@@ -52,7 +52,7 @@ void defaults() {
     const auto args = parse({"input.elf", "output.elf"});
     require(args.inputPath == "input.elf", "input path was not captured");
     require(args.outputPath == "output.elf", "output path was not captured");
-    require(!args.skipSyscallCheck && !args.skipSceModule && !args.toIntel && !args.writeRegistry &&
+    require(!args.skipSyscallCheck && !args.trapSdkSyscallStubs && !args.skipSceModule && !args.toIntel && !args.writeRegistry &&
         !args.toWindows && !args.lazyBinding && !args.autorun && !args.windowsDiagnostics && !args.windowsGui,
         "a flag defaulted to true");
     require(args.unusedFilterLevel == 0u, "unused filter level did not default to 0");
@@ -74,6 +74,13 @@ void booleanFlags() {
     require(args.windowsDiagnostics, "--windows-diagnostics was ignored");
     require(args.windowsGui, "--windows-gui was ignored");
     require(args.inputPath == "input.elf" && args.outputPath == "output.elf", "flags consumed the positional paths");
+}
+
+void trapSdkSyscallStubs() {
+    const auto args = parse({"--trap-sdk-syscall-stubs", "input.elf", "output.elf"});
+    require(args.trapSdkSyscallStubs, "--trap-sdk-syscall-stubs was ignored");
+    expectThrows({"--skip-syscall-check", "--trap-sdk-syscall-stubs", "input.elf", "output.elf"},
+        "--skip-syscall-check conflicts with --trap-sdk-syscall-stubs");
 }
 
 void positionalsInterleaveWithFlags() {
@@ -126,6 +133,15 @@ void excludeConflictsWithSkip() {
     expectThrows({"--exclude-sce-module", "m", "--skip-sce-module", "input.elf", "output.elf"}, message);
 }
 
+void executables() {
+    const auto args = parse({"--executable", "picker/picker.bin", "input.elf", "--executable", "es-de/es-de.bin", "output.elf"});
+    require(args.executables == std::vector<std::string>{"picker/picker.bin", "es-de/es-de.bin"}, "--executable paths were not recorded in order");
+    expectThrows({"--executable"}, "--executable requires a nonempty path");
+    expectThrows({"--executable", "", "input.elf", "output.elf"}, "--executable requires a nonempty path");
+    expectThrows({"--executable", "--registry", "input.elf", "output.elf"}, "--executable requires a nonempty path");
+    expectThrows({"--skip-sce-module", "--executable", "picker.bin", "input.elf", "output.elf"}, "--executable conflicts with --skip-sce-module");
+}
+
 void unusedFilter() {
     for (const auto& value : {std::string("0"), std::string("1"), std::string("2")}) {
         const auto args = parse({"unused-filter=" + value, "input.elf", "output.elf"});
@@ -154,6 +170,13 @@ void unusedFilterBareWordIsUnknown() {
 void unknownOption() {
     expectThrows({"--nonexistent", "input.elf", "output.elf"}, "unknown option: --nonexistent");
     expectThrows({"--", "input.elf", "output.elf"}, "unknown option: --");
+}
+
+void emptyPositionals() {
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+            {"", "input.elf", "output.elf"}, {"input.elf", "", "output.elf"},
+            {"", "output.elf"}, {"input.elf", ""}})
+        expectThrows(arguments, "input and output paths must be nonempty");
 }
 
 void tooManyPositionals() {
@@ -189,6 +212,7 @@ int main() {
     try {
         defaults();
         booleanFlags();
+        trapSdkSyscallStubs();
         positionalsInterleaveWithFlags();
         singleDashIsPositional();
         rpath();
@@ -198,11 +222,13 @@ int main() {
         excludeSceModuleConsumesNextTokenVerbatim();
         excludeSceModuleWithoutValue();
         excludeConflictsWithSkip();
+        executables();
         unusedFilter();
         unusedFilterRejectsBadValues();
         unusedFilterRejectsDuplicates();
         unusedFilterBareWordIsUnknown();
         unknownOption();
+        emptyPositionals();
         tooManyPositionals();
         windowsDiagnosticsRequiresWindows();
         windowsGuiRequiresWindows();

@@ -1,5 +1,6 @@
 #include "Optimization/ConstantFolder.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "IntermediateRepresentation/IrMetadata/StageIO.hpp"
 
 #include <algorithm>
 #include <array>
@@ -51,6 +52,105 @@ template <typename TFunction> bool foldU64Shift(IrBuilder& builder, IrValue& ins
         return false;
     }
     replaceWith(inst, builder.ConstantU64(static_cast<std::uint64_t>(function(value.ImmediateU64(), shift.ImmediateU32()))));
+    return true;
+}
+
+bool foldConstantBitTest(IrBuilder& builder, IrValue& inst) {
+    auto& left = resolveArg(inst, 0);
+    auto& right = resolveArg(inst, 1);
+    if (!isImmediate(right, IrType::U32) || right.ImmediateU32() != 0u || left.Opcode() != IrOpcode::BitwiseAnd32) return false;
+    auto& first = resolveArg(left, 0);
+    auto& second = resolveArg(left, 1);
+    IrValue* shifted = nullptr;
+    if (isImmediate(second, IrType::U32) && second.ImmediateU32() == 1u) shifted = &first;
+    else if (isImmediate(first, IrType::U32) && first.ImmediateU32() == 1u) shifted = &second;
+    if (shifted == nullptr || shifted->Opcode() != IrOpcode::ShiftRightLogical32) return false;
+    auto& word = resolveArg(*shifted, 0);
+    auto& amount = resolveArg(*shifted, 1);
+    if (!isImmediate(word, IrType::U32) || (word.ImmediateU32() != 0u && word.ImmediateU32() != 0xffffffffu)) return false;
+    if (amount.Opcode() != IrOpcode::BitwiseAnd32) return false;
+    auto& amountLeft = resolveArg(amount, 0);
+    auto& amountRight = resolveArg(amount, 1);
+    const bool masked = (isImmediate(amountLeft, IrType::U32) && amountLeft.ImmediateU32() == 31u) || (isImmediate(amountRight, IrType::U32) && amountRight.ImmediateU32() == 31u);
+    if (!masked) return false;
+    replaceWith(inst, builder.ConstantBool(word.ImmediateU32() != 0u));
+    return true;
+}
+
+bool isLaneIndex(const IrValue& value) {
+    return value.Opcode() == IrOpcode::LaneId;
+}
+
+bool isImmediateU32(const IrValue& value, std::uint32_t immediate) {
+    return isImmediate(value, IrType::U32) && value.ImmediateU32() == immediate;
+}
+
+bool runsAllStartingLanes(const IrProgram& program, const IrBlock* target) {
+    if (program.BlockOrder().empty()) return false;
+    const IrBlock* block = program.BlockOrder().front();
+    for (std::size_t steps = 0; block != nullptr && steps < program.BlockOrder().size(); ++steps) {
+        if (block == target) return true;
+        if (block->Successors().size() != 1u) return false;
+        block = block->Successors().front();
+        if (block->Predecessors().size() != 1u) return false;
+    }
+    return false;
+}
+
+bool holdsStartingLanes(const IrProgram& program, const IrValue& word, std::uint32_t index, std::uint32_t depth = 0) {
+    if (depth > 8u) return false;
+    if (word.Opcode() == IrOpcode::BitwiseAnd32) {
+        return holdsStartingLanes(program, resolveArg(word, 0), index, depth + 1u) && holdsStartingLanes(program, resolveArg(word, 1), index, depth + 1u);
+    }
+    if (word.Opcode() == IrOpcode::BitwiseOr32) {
+        return holdsStartingLanes(program, resolveArg(word, 0), index, depth + 1u) || holdsStartingLanes(program, resolveArg(word, 1), index, depth + 1u);
+    }
+    if (word.Opcode() != IrOpcode::CompositeExtractU32x4 || !isImmediateU32(resolveArg(word, 1), index)) return false;
+    const auto& ballot = resolveArg(word, 0);
+    if (ballot.Opcode() != IrOpcode::Ballot || !runsAllStartingLanes(program, ballot.Parent())) return false;
+    const auto& condition = resolveArg(ballot, 0);
+    if (isImmediate(condition, IrType::U1)) return condition.ImmediateBool();
+    if (condition.Opcode() != IrOpcode::IEqual32) return false;
+    const auto helper = [](const IrValue& value) {
+        if (value.Opcode() != IrOpcode::GetBuiltin) return false;
+        const auto& kind = resolveArg(value, 0);
+        return isImmediate(kind, IrType::U32) && static_cast<StageInputKind>(kind.ImmediateU32()) == StageInputKind::HelperInvocation;
+    };
+    const auto& lhs = resolveArg(condition, 0);
+    const auto& rhs = resolveArg(condition, 1);
+    return (helper(lhs) && isImmediateU32(rhs, 0u)) || (helper(rhs) && isImmediateU32(lhs, 0u));
+}
+
+bool foldStartingQuadBitTest(const IrProgram& program, IrBuilder& builder, IrValue& inst) {
+    if (program.Resources().stage != IrShaderStage::Pixel) return false;
+    auto& left = resolveArg(inst, 0);
+    auto& right = resolveArg(inst, 1);
+    if (!isImmediateU32(right, 0u) || left.Opcode() != IrOpcode::BitwiseAnd32) return false;
+    IrValue* shifted = isImmediateU32(resolveArg(left, 1), 1u) ? &resolveArg(left, 0) : isImmediateU32(resolveArg(left, 0), 1u) ? &resolveArg(left, 1) : nullptr;
+    if (shifted == nullptr || shifted->Opcode() != IrOpcode::ShiftRightLogical32) return false;
+    const auto& amount = resolveArg(*shifted, 1);
+    if (amount.Opcode() != IrOpcode::BitwiseAnd32) return false;
+    const bool laneAmount = (isLaneIndex(resolveArg(amount, 0)) && isImmediateU32(resolveArg(amount, 1), 31u)) || (isLaneIndex(resolveArg(amount, 1)) && isImmediateU32(resolveArg(amount, 0), 31u));
+    if (!laneAmount) return false;
+    const auto& word = resolveArg(*shifted, 0);
+    const IrValue* low = &word;
+    const IrValue* high = nullptr;
+    if (word.Opcode() == IrOpcode::SelectU32) {
+        const auto& half = resolveArg(word, 0);
+        if (half.Opcode() != IrOpcode::ULessThan32 || !isLaneIndex(resolveArg(half, 0)) || !isImmediateU32(resolveArg(half, 1), 32u)) return false;
+        low = &resolveArg(word, 1);
+        high = &resolveArg(word, 2);
+    } else if (program.WaveSize() != 32u) {
+        return false;
+    }
+    if (low->Opcode() != IrOpcode::CompositeExtractU64 || !isImmediateU32(resolveArg(*low, 1), 0u)) return false;
+    const auto& wqm = resolveArg(*low, 0);
+    if (high != nullptr && (high->Opcode() != IrOpcode::CompositeExtractU64 || &resolveArg(*high, 0) != &wqm || !isImmediateU32(resolveArg(*high, 1), 1u))) return false;
+    if (wqm.Opcode() != IrOpcode::WqmU64) return false;
+    const auto& lanes = resolveArg(wqm, 0);
+    if (lanes.Opcode() != IrOpcode::CompositeConstructU64 || !holdsStartingLanes(program, resolveArg(lanes, 0), 0u)) return false;
+    if (high != nullptr && !holdsStartingLanes(program, resolveArg(lanes, 1), 1u)) return false;
+    replaceWith(inst, builder.ConstantBool(true));
     return true;
 }
 
@@ -122,7 +222,7 @@ bool foldPhi(IrValue& inst) {
         }
         if (same == nullptr) {
             same = value;
-        } else if (!(*same == *value)) {
+        } else if (same != value && !(same->HasImmediate() && value->HasImmediate() && *same == *value)) {
             return false;
         }
     }
@@ -186,18 +286,27 @@ bool foldCompositeExtract(IrBuilder& builder, IrValue& inst, IrOpcode construct,
 }
 
 bool forwardsWord(const IrUse& use) {
-    return use.user->Opcode() == IrOpcode::Identity || (use.user->Opcode() == IrOpcode::SelectU32 && use.operand != 0u);
+    return use.user->Opcode() == IrOpcode::Identity || use.user->Opcode() == IrOpcode::Phi || (use.user->Opcode() == IrOpcode::SelectU32 && use.operand != 0u);
 }
 
-void collectReaders(IrValue& value, std::vector<IrUse>& readers) {
+void collectReaders(IrValue& value, std::vector<IrUse>& readers, std::vector<const IrValue*>& visited) {
+    if (std::ranges::find(visited, &value) != visited.end()) {
+        return;
+    }
+    visited.push_back(&value);
     const std::vector<IrUse> uses = value.OperandUses();
     for (const IrUse& use : uses) {
         if (forwardsWord(use)) {
-            collectReaders(*use.user, readers);
+            collectReaders(*use.user, readers, visited);
         } else {
             readers.push_back(use);
         }
     }
+}
+
+void collectReaders(IrValue& value, std::vector<IrUse>& readers) {
+    std::vector<const IrValue*> visited;
+    collectReaders(value, readers, visited);
 }
 
 constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 2> packedFields {{{8u, 4u}, {16u, 13u}}};
@@ -212,9 +321,25 @@ std::optional<std::size_t> packedField(std::uint32_t offset, std::uint32_t count
     return static_cast<std::size_t>(field - packedFields.begin());
 }
 
+bool isPackedAncillary(const IrValue& builtin) {
+    auto& kind = resolveArg(builtin, 0);
+    return isImmediate(kind, IrType::U32) && static_cast<StageInputKind>(kind.ImmediateU32()) == StageInputKind::PackedAncillary;
+}
+
+IrValue& insertBefore(IrProgram& program, IrValue& next, IrOpcode opcode, IrValue& lhs, IrValue& rhs) {
+    IrValue& created = program.CreateValue(opcode, IrType::U32);
+    created.AddArgument(&lhs);
+    created.AddArgument(&rhs);
+    next.Parent()->InsertInstructionBefore(&next, &created);
+    return created;
+}
+
+IrValue& insertBuiltin(IrProgram& program, IrBuilder& builder, IrValue& next, StageInputKind kind) {
+    return insertBefore(program, next, IrOpcode::GetBuiltin, builder.Constant(static_cast<std::uint32_t>(kind)), builder.Constant(0u));
+}
+
 void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancillary) {
-    auto& kind = resolveArg(ancillary, 0);
-    if (!isImmediate(kind, IrType::U32) || static_cast<StageInputKind>(kind.ImmediateU32()) != StageInputKind::PackedAncillary) {
+    if (!isPackedAncillary(ancillary)) {
         return;
     }
     const std::vector<IrUse> uses = ancillary.OperandUses();
@@ -231,36 +356,42 @@ void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
     for (const IrUse& use : forwarded) {
         collectReaders(*use.user, readers);
     }
-    for (const IrUse& use : readers) {
+    const auto extractsField = [](const IrUse& use) {
         const IrValue& user = *use.user;
         if ((user.Opcode() != IrOpcode::BitFieldUExtract && user.Opcode() != IrOpcode::BitFieldSExtract) || use.operand != 0u) {
-            return;
+            return false;
         }
         auto& offset = resolveArg(user, 1);
         auto& count = resolveArg(user, 2);
-        if (!isImmediate(offset, IrType::U32) || !isImmediate(count, IrType::U32) || count.ImmediateU32() == 0u ||
-            !packedField(offset.ImmediateU32(), count.ImmediateU32())) {
-            return;
-        }
+        return isImmediate(offset, IrType::U32) && isImmediate(count, IrType::U32) && count.ImmediateU32() != 0u &&
+               packedField(offset.ImmediateU32(), count.ImmediateU32()).has_value();
+    };
+    const bool whole = std::ranges::all_of(readers, extractsField);
+    if (!whole) {
+        std::vector<IrUse> extracts;
+        const auto collectExtracts = [&](const auto& self, IrValue& value) -> void {
+            for (const IrUse& use : value.OperandUses()) {
+                if (use.user->Opcode() == IrOpcode::Identity) {
+                    self(self, *use.user);
+                } else if (extractsField(use)) {
+                    extracts.push_back(use);
+                }
+            }
+        };
+        collectExtracts(collectExtracts, ancillary);
+        direct = std::move(extracts);
+        forwarded.clear();
     }
     std::array<IrValue*, 2> fields {};
     const auto field = [&](std::size_t index) -> IrValue& {
+        if (fields[index] == nullptr && index == 1u) fields[index] = &builder.Constant(0u);
         if (fields[index] == nullptr) {
-            const auto builtin = index == 0u ? StageInputKind::SampleId : StageInputKind::Layer;
-            IrValue& created = program.CreateValue(IrOpcode::GetBuiltin, IrType::U32);
-            created.AddArgument(&builder.Constant(static_cast<std::uint32_t>(builtin)));
-            created.AddArgument(&builder.Constant(0u));
-            ancillary.Parent()->InsertInstructionBefore(&ancillary, &created);
-            fields[index] = &created;
+            fields[index] = &insertBuiltin(program, builder, ancillary, StageInputKind::SampleId);
         }
         return *fields[index];
     };
     const auto emit = [&](IrOpcode opcode, IrValue& lhs, IrValue& rhs) -> IrValue& {
-        IrValue& created = program.CreateValue(opcode, IrType::U32);
-        created.AddArgument(&lhs);
-        created.AddArgument(&rhs);
-        ancillary.Parent()->InsertInstructionBefore(&ancillary, &created);
-        return created;
+        return insertBefore(program, ancillary, opcode, lhs, rhs);
     };
     if (!forwarded.empty()) {
         IrValue& sample = emit(IrOpcode::ShiftLeftLogical32, field(0u), builder.Constant(8u));
@@ -352,10 +483,6 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
                 replaceWith(value, builder.Constant(static_cast<std::uint32_t>(operand.ImmediateU16())));
                 return true;
             }
-            if (operand.Opcode() == IrOpcode::ConvertU16U32) {
-                replaceWith(value, *operand.Argument(0));
-                return true;
-            }
             return false;
         }
         case IrOpcode::ConvertU8U32: {
@@ -370,10 +497,6 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
             auto& operand = resolveArg(value, 0);
             if (isImmediate(operand, IrType::U8)) {
                 replaceWith(value, builder.Constant(static_cast<std::uint32_t>(operand.ImmediateU8())));
-                return true;
-            }
-            if (operand.Opcode() == IrOpcode::ConvertU8U32) {
-                replaceWith(value, *operand.Argument(0));
                 return true;
             }
             return false;
@@ -578,6 +701,19 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
             replaceWith(value, builder.Constant(static_cast<std::uint32_t>(std::popcount(operand.ImmediateU64()))));
             return true;
         }
+        case IrOpcode::BitReverse32: {
+            auto& operand = resolveArg(value, 0);
+            if (!isImmediate(operand, IrType::U32)) {
+                return false;
+            }
+            const std::uint32_t word = operand.ImmediateU32();
+            std::uint32_t reversed = 0;
+            for (std::uint32_t bit = 0; bit < 32; ++bit) {
+                reversed |= ((word >> bit) & 1u) << (31u - bit);
+            }
+            replaceWith(value, builder.Constant(reversed));
+            return true;
+        }
         case IrOpcode::SMin32:
         case IrOpcode::SMax32: {
             const auto opcode = value.Opcode();
@@ -594,7 +730,7 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
             return foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return std::max(a, b); });
         }
         case IrOpcode::IEqual32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a == b; });
-        case IrOpcode::INotEqual32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a != b; });
+        case IrOpcode::INotEqual32: return foldConstantBitTest(builder, value) || foldStartingQuadBitTest(program, builder, value) || foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a != b; });
         case IrOpcode::ULessThan32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a < b; });
         case IrOpcode::ULessThanEqual32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a <= b; });
         case IrOpcode::UGreaterThan32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a > b; });
@@ -708,6 +844,24 @@ void ConstantFolder::Fold(IrProgram& program, std::span<IrBlock* const> blocks) 
 
 void ConstantFolder::Fold(IrProgram& program) const {
     Fold(program, program.BlockOrder());
+}
+
+bool ConstantFolder::ComposePackedAncillary(IrProgram& program) const {
+    std::vector<IrValue*> words;
+    for (IrBlock* block : program.BlockOrder()) {
+        for (IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() == IrOpcode::GetBuiltin && inst->HasUses() && isPackedAncillary(*inst)) {
+                words.push_back(inst);
+            }
+        }
+    }
+    IrBuilder builder(program);
+    for (IrValue* word : words) {
+        IrValue& primitive = insertBuiltin(program, builder, *word, StageInputKind::RasterPrimitive);
+        IrValue& sample = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, insertBuiltin(program, builder, *word, StageInputKind::SampleId), builder.Constant(8u));
+        word->ReplaceAllUsesWith(&insertBefore(program, *word, IrOpcode::BitwiseOr32, primitive, sample));
+    }
+    return !words.empty();
 }
 
 }

@@ -81,7 +81,9 @@ def main():
                 assert set(artifacts) == expected, artifacts
                 for artifact in artifacts:
                     assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF")
-                    assert f"    {artifact.relative_to(case / 'app0').as_posix()}\n" in result.stdout, result.stdout
+                    tree = result.stdout.split("Arrange the files like this:\n", 1)[1]
+                    assert f"-- {artifact.parent.name}/\n" in tree, tree
+                    assert f"              |-- {artifact.name}\n" in tree, tree
                 if windows and os.name == "nt":
                     run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
                     assert run.returncode == 42, (run.returncode, run.stdout, run.stderr)
@@ -109,6 +111,19 @@ def main():
             result, output = convert(case, windows)
             assert result.returncode == 2 and "not a directory" in result.stderr, result.stderr
             assert not output.exists(), output
+
+            for magic in (b"\x4f\x15\x3d\x1d", b"\x54\x14\xf5\xee"):
+                case = work / f"{windows}-self-{magic.hex()}"
+                for name in ("sce_module", "prx"):
+                    (case / name).mkdir(parents=True)
+                (case / "sce_module" / "libc.prx").write_bytes(magic + bytes(0x1000))
+                (case / "prx" / "provider.prx").write_bytes(module_with_symbol(True))
+                result, output = convert(case, windows)
+                assert result.returncode == 0 and output.exists(), result.stderr
+                assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"provider.prx.guest.prx"}
+                result, output = convert(case, windows, ["--exclude-sce-module", "libc.prx"])
+                assert result.returncode == 0 and output.exists(), result.stderr
+                assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"provider.prx.guest.prx"}
 
             case = work / f"{windows}-ambiguous"
             for name in ("sce_module", "sce_modules", "prx"):

@@ -24,37 +24,86 @@ if(BUILD_TESTING)
 endif()
 
 option(ANYPS5_ENABLE_SPIRV_TOOLS "Enable SPIRV-Tools validation and optimization" OFF)
+option(ANYPS5_ENABLE_ASAN "Build Linux targets with AddressSanitizer and use an ASan-compatible guest arena range" OFF)
 option(APS5_ENABLE_TIMING_LOG "Write frame timings asynchronously to frame-timing.log" OFF)
+option(APS5_ENABLE_TRACY "Build the Tracy profiler client and report performance timer scopes as Tracy zones" OFF)
+option(ANYPS5_USE_SYSTEM_DEPS "Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Headers, glslang and SPIRV-Tools from the system instead of the bundled submodules" OFF)
 add_compile_definitions(APS5_ENABLE_TIMING_LOG=$<BOOL:${APS5_ENABLE_TIMING_LOG}>)
+include(cmake/SystemDeps.cmake)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT APPLE)
+if(ANYPS5_ENABLE_ASAN)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "ANYPS5_ENABLE_ASAN is supported only on Linux")
+    endif()
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
+        message(FATAL_ERROR "ANYPS5_ENABLE_ASAN requires GCC or Clang")
+    endif()
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+    add_compile_definitions(ANYPS5_ENABLE_ASAN=1)
+elseif(NOT APPLE)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
 endif()
 
 if(BUILD_TESTING)
+    add_test_executable(shader_cache_file_read_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/CacheFileReadTests.cpp)
+    target_include_directories(shader_cache_file_read_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler)
+    add_test(NAME shader_cache_file_read COMMAND shader_cache_file_read_tests)
+    set_tests_properties(shader_cache_file_read PROPERTIES TIMEOUT 20)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME pr_overlap_encoding COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_encoding.py)
+        add_test(NAME pr_overlap_dependencies COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_dependencies.py)
         add_test(NAME pr_overlap_tools COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap.py)
+        add_test(NAME progress_history COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_history.py)
         add_test(NAME progress_report COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress.py)
         add_test(NAME progress_encoding COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_encoding.py)
+        add_test(NAME progress_render_sliver COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_render_sliver.py)
+        add_test(NAME progress_wrappers COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_wrappers.py)
         add_test(NAME import_audit COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_import_audit.py)
         add_test(NAME conventions_function_bodies COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_comments.py)
+        add_test(NAME conventions_wrapped_declarations COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_wrapped_declarations.py)
+        add_test(NAME conventions_ci_gate COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_ci_gate.py)
+        add_test(NAME test_registration COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_test_registration.py)
+        add_test(NAME check_skips COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_skips.py)
+        add_test(NAME stubgen COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_stubgen.py)
+        add_test(NAME debt_split COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_debt_split.py)
         add_test(NAME hardware_oracle COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/hw-oracle/test_hw_oracle.py)
         add_test(NAME pr_overlap_exports COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_exports.py)
+        add_test(NAME pr_overlap_wrapped_exports COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_wrapped_exports.py)
         add_test(NAME nid_database_cache COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_nid_names.py)
+        add_test(NAME release_package COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_package_release.py)
+        add_test(NAME pad_input COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pad_input.py)
+        set_tests_properties(pad_input PROPERTIES TIMEOUT 20)
+        add_test(NAME trace_digest COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_digest.py)
     endif()
 endif()
 
@@ -78,10 +127,28 @@ set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_HIDAPI ON CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC_PIC ON CACHE BOOL "" FORCE)
-set(ANYPS5_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
-set(CMAKE_EXE_LINKER_FLAGS "")
-add_subdirectory(3rdparty/SDL2)
-set(CMAKE_EXE_LINKER_FLAGS "${ANYPS5_EXE_LINKER_FLAGS}")
+if(NOT ANYPS5_USE_SYSTEM_DEPS)
+    set(ANYPS5_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+    set(CMAKE_EXE_LINKER_FLAGS "")
+    add_subdirectory(3rdparty/SDL2)
+    set(CMAKE_EXE_LINKER_FLAGS "${ANYPS5_EXE_LINKER_FLAGS}")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        get_directory_property(ANYPS5_SDL_X11_XRANDR DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_X11_XRANDR)
+        if(NOT ANYPS5_SDL_X11_XRANDR)
+            message(FATAL_ERROR "SDL has no XRandR support, so X11 display refresh rates cannot be queried. "
+                "Install libxrandr-dev (Debian, Ubuntu) or libXrandr-devel (Fedora), "
+                "enable SDL_X11_XRANDR, then rerun configuration.")
+        endif()
+        get_directory_property(ANYPS5_SDL_PIPEWIRE DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_PIPEWIRE)
+        get_directory_property(ANYPS5_SDL_PULSEAUDIO DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_PULSEAUDIO)
+        get_directory_property(ANYPS5_SDL_ALSA DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_ALSA)
+        if(NOT ANYPS5_SDL_PIPEWIRE AND NOT ANYPS5_SDL_PULSEAUDIO AND NOT ANYPS5_SDL_ALSA)
+            message(FATAL_ERROR "SDL found no PipeWire, PulseAudio or ALSA development files, so audio output would be silent. "
+                "Install libpipewire-0.3-dev, libpulse-dev and libasound2-dev (Debian, Ubuntu) "
+                "or pipewire-devel, pulseaudio-libs-devel and alsa-lib-devel (Fedora), then rerun configuration.")
+        endif()
+    endif()
+endif()
 set(ARCHITECTURE x86_64)
 add_subdirectory(3rdparty/ffmpeg-core)
 if(MINGW)
@@ -90,19 +157,33 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(ffmpeg INTERFACE LINKER:--exclude-libs,ALL)
 endif()
 
+if(APS5_ENABLE_TRACY)
+    include(cmake/Tracy.cmake)
+endif()
+
 set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
-add_subdirectory(3rdparty/freetype EXCLUDE_FROM_ALL)
-set_target_properties(freetype PROPERTIES POSITION_INDEPENDENT_CODE ON)
-if(WIN32)
-    get_target_property(freetypeSources freetype SOURCES)
-    list(FILTER freetypeSources EXCLUDE REGEX "ftver\\.rc$")
-    set_target_properties(freetype PROPERTIES SOURCES "${freetypeSources}")
+if(NOT ANYPS5_USE_SYSTEM_DEPS)
+    add_subdirectory(3rdparty/freetype EXCLUDE_FROM_ALL)
+    set_target_properties(freetype PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    if(WIN32)
+        get_target_property(freetypeSources freetype SOURCES)
+        list(FILTER freetypeSources EXCLUDE REGEX "ftver\\.rc$")
+        set_target_properties(freetype PROPERTIES SOURCES "${freetypeSources}")
+    endif()
 endif()
+
+set(LIBUSB_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(LIBUSB_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
+set(LIBUSB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(LIBUSB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LIBUSB_ENABLE_UDEV OFF CACHE BOOL "" FORCE)
+add_subdirectory(3rdparty/libusb-cmake EXCLUDE_FROM_ALL)
+set_target_properties(usb-1.0 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory(core/shader/recompiler)
 add_subdirectory(core/Decoder/Jpeg)

@@ -48,6 +48,7 @@ bool LaneSource(const IrProgram& program, const IrValue& value) {
     case IrOpcode::WriteLane:
     case IrOpcode::DataAppend:
     case IrOpcode::DataConsume:
+    case IrOpcode::LoadVectorWindow:
         return true;
     case IrOpcode::GetBuiltin: {
         const auto* kind = value.Argument(0)->Resolve();
@@ -325,6 +326,13 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                     }
                     requirements.functionScratch = true;
                 }
+                if (program.Resources().memoryInfo.at(memoryIndex).kind == ResourceKind::Flat && program.Resources().stage == IrShaderStage::Compute && program.Info().scratchDwords != 0u) {
+                    requirements.functionScratch = true;
+                }
+                if (program.Resources().memoryInfo.at(memoryIndex).kind == ResourceKind::Flat && program.Resources().stage == IrShaderStage::Compute && addressAccess == AddressAccess::Atomic && inst->Type() == IrType::U64) {
+                    requirements.ldsLock = true;
+                    requirements.subgroupBallot = true;
+                }
             }
             if (BufferAccessOf(inst->Opcode()) != BufferAccess::None) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
@@ -437,6 +445,7 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
             requirements.functionLdsDwords = static_cast<std::uint32_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u));
         }
     }
+    requirements.coherentBufferAlias = requirements.coherentBuffers && !program.Metadata().invalidatesCaches;
     return requirements;
 }
 

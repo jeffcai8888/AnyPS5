@@ -81,7 +81,7 @@ inline bool DrawOpcode(std::uint32_t opcode) { return opcode == 0x27 || opcode =
 std::string Name(std::uint32_t header);
 // A PM4 type-2 packet is a one-dword filler (command-buffer padding); type 3 and type 0 carry a
 // dword count in bits 29:16. Type 1 is undefined.
-inline bool FillerPacket(std::uint32_t header) { return (header >> 30u) == 2u; }
+inline bool FillerPacket(std::uint32_t header) { return (header >> 30u) == 2u || header == 0xffff1000u; }
 inline std::size_t PacketWords(std::uint32_t header) { return FillerPacket(header) ? 1u : static_cast<std::size_t>((header >> 16u) & 0x3fffu) + 2u; }
 std::string_view UnsupportedReason(std::uint32_t header);
 void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue);
@@ -140,12 +140,15 @@ struct MemoryCopy {
     std::size_t bytes;
 };
 std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet);
+std::uint32_t DmaSource(std::span<const std::uint32_t> packet);
+std::uint32_t DmaDestination(std::span<const std::uint32_t> packet);
 // A DISPATCH_INDIRECT's arguments: the guest address of its three group-count dwords (no memory
 // access, so the GPU can read them in place: VulkanDevice::DispatchIndirect), the DISPATCH_DIRECT
 // packet made by reading them there (through the checked guest memory path, which waits for
 // recorded GPU work that writes them), and both steps in one for the packet.
 std::uint64_t DispatchArgumentAddress(std::span<const std::uint32_t> packet, const QueueState& queue);
 std::array<std::uint32_t, 5> ReadDispatchArguments(std::uint64_t arguments, std::uint32_t initiator);
+std::array<std::uint32_t, 3> PartialGroupThreads(const std::array<std::uint32_t, 3>& groups, const std::array<std::uint32_t, 3>& numThreads);
 std::array<std::uint32_t, 5> ResolveDispatch(std::span<const std::uint32_t> packet, const QueueState& queue);
 DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueState& queue);
 

@@ -22,6 +22,8 @@
 namespace GuestHeap {
 namespace {
 
+constexpr std::uint32_t ReadWriteProtection = 0x04;
+
 // Each block is preceded by a header holding the raw block address and its size in bytes.
 constexpr std::size_t HeaderBytes = 2 * sizeof(void*);
 constexpr std::size_t RawAlignment = 16;
@@ -110,12 +112,7 @@ private:
     }
 
     static void commit(void* pointer, std::size_t bytes) {
-#ifdef _WIN32
-        GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, bytes);
-#else
-        (void)pointer;
-        (void)bytes;
-#endif
+        GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, ReadWriteProtection, bytes);
     }
 
     // Freed large blocks stay committed and are handed out again for the same block size: the game
@@ -168,10 +165,8 @@ private:
         }
 
         static void release(void* raw, std::size_t bytes) {
-#ifdef _WIN32
             GuestArena::GuestArenaReset_nid_postfix(raw, bytes);
             GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(raw), bytes);
-#endif
             GuestArena::GuestArenaRelease_nid_postfix(raw, bytes);
         }
 
@@ -198,7 +193,7 @@ void rawFree(void* raw, std::size_t blockBytes) {
     else std::free(raw);
 }
 
-void* allocate(GuestAllocations::Mutation& mutation, std::size_t alignment, std::size_t bytes) {
+void* allocate(GuestAllocations::Mutation& mutation, std::size_t alignment, std::size_t bytes, bool gpu) {
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) throw std::invalid_argument("invalid guest heap alignment");
     alignment = std::max(alignment, MinimumAlignment);
     const std::size_t padding = alignment > RawAlignment ? alignment : 0;
@@ -210,7 +205,7 @@ void* allocate(GuestAllocations::Mutation& mutation, std::size_t alignment, std:
     reinterpret_cast<void**>(pointer)[-2] = raw;
     reinterpret_cast<std::size_t*>(pointer)[-1] = blockBytes;
     try {
-        mutation.Add(pointer, bytes, true, true);
+        mutation.Add(pointer, bytes, true, true, gpu);
     } catch (...) {
         rawFree(raw, blockBytes);
         throw;
@@ -227,7 +222,7 @@ void free(GuestAllocations::Mutation& mutation, void* pointer) {
 
 void* GuestHeapAllocate_nid_postfix(std::size_t bytes) {
     GuestAllocations::Mutation mutation;
-    return allocate(mutation, MinimumAlignment, bytes);
+    return allocate(mutation, MinimumAlignment, bytes, false);
 }
 
 void GuestHeapFree_nid_postfix(void* pointer) {
@@ -247,7 +242,7 @@ void* GuestHeapReallocate_nid_postfix(void* pointer, std::size_t bytes) {
         free(mutation, pointer);
         return nullptr;
     }
-    void* result = allocate(mutation, MinimumAlignment, bytes);
+    void* result = allocate(mutation, MinimumAlignment, bytes, range.gpu);
     std::memcpy(result, pointer, std::min(bytes, range.bytes));
     free(mutation, pointer);
     return result;
@@ -262,15 +257,26 @@ void* GuestHeapRealign_nid_postfix(void* pointer, std::size_t bytes, std::size_t
         free(mutation, pointer);
         return nullptr;
     }
-    void* result = allocate(mutation, alignment, bytes);
+    void* result = allocate(mutation, alignment, bytes, range.gpu);
     std::memcpy(result, pointer, std::min(bytes, range.bytes));
     free(mutation, pointer);
     return result;
 }
 
+std::size_t GuestHeapUsableSize_nid_postfix(const void* pointer) {
+    if (pointer == nullptr) return 0;
+    GuestAllocations::Mutation mutation;
+    return mutation.Find(pointer).bytes;
+}
+
 void* GuestHeapAlign_nid_postfix(std::size_t alignment, std::size_t bytes) {
     GuestAllocations::Mutation mutation;
-    return allocate(mutation, alignment, bytes);
+    return allocate(mutation, alignment, bytes, false);
+}
+
+void* GuestHeapAlignForGpu_nid_postfix(std::size_t alignment, std::size_t bytes) {
+    GuestAllocations::Mutation mutation;
+    return allocate(mutation, alignment, bytes, true);
 }
 
 }

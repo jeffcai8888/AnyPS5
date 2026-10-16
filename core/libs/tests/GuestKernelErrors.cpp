@@ -62,7 +62,10 @@ int main() {
     Require(sceKernelCreateSema(&semaphore, "limit", 1, 1, 3, nullptr) == SCE_OK);
     Require(sceKernelSignalSema(semaphore, 3) == SCE_KERNEL_ERROR_EINVAL);
     Require(sceKernelSignalSema(semaphore, 2) == SCE_OK);
+    Require(sceKernelSignalSema(semaphore, 0) == SCE_OK);
     Require(sceKernelPollSema(semaphore, 3) == SCE_OK);
+    Require(sceKernelSignalSema(semaphore, 0) == SCE_OK);
+    Require(sceKernelPollSema(semaphore, 1) == SCE_KERNEL_ERROR_EBUSY);
     Require(sceKernelDeleteSema(semaphore) == SCE_OK);
 
     KernelEqueue eq = 0;
@@ -87,13 +90,7 @@ int main() {
     Require(scePthreadMutexattrSettype(&attr, 5) == SCE_KERNEL_ERROR_EINVAL);
     Require(scePthreadMutexattrSetprotocol(&attr, PRIO_NONE) == SCE_OK);
     Require(scePthreadMutexattrSetprotocol(&attr, PRIO_INHERIT) == SCE_OK);
-    bool protectionRejected = false;
-    try {
-        scePthreadMutexattrSetprotocol(&attr, PRIO_PROTECT);
-    } catch (const std::invalid_argument&) {
-        protectionRejected = true;
-    }
-    Require(protectionRejected);
+    Require(scePthreadMutexattrSetprotocol(&attr, PRIO_PROTECT) == SCE_OK);
     PthreadMutex mutex = nullptr;
     Require(scePthreadMutexInit(&mutex, &attr, nullptr) == SCE_OK);
     Require(scePthreadMutexattrDestroy(&attr) == SCE_OK);

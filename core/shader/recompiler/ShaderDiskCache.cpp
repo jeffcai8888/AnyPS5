@@ -11,6 +11,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 #include "ShaderCacheVersion.hpp"
 #include <algorithm>
@@ -53,7 +55,15 @@ std::filesystem::path ShaderCacheDirectory() {
     const char* directory = std::getenv("ANYPS5_SHADER_CACHE_DIR");
     if (directory != nullptr && *directory != '\0') return std::filesystem::path(directory);
     std::error_code error;
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+    const auto executable = std::filesystem::canonical(buffer.data(), error);
+#else
     const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+#endif
     if (error) return {};
     return executable.parent_path() / "shader_cache";
 #endif
@@ -64,18 +74,18 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 184, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 200, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 112, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 296, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 448, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(RecompileResult) == 320, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(DescriptorBinding) == 568, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
 static_assert(sizeof(CompiledShaderInfo) == 344, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 232, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
-static_assert(sizeof(ImageResource) == 112, "ImageResource changed: update the info encoder");
-static_assert(sizeof(SamplerResource) == 16, "SamplerResource changed: update the info encoder");
+static_assert(sizeof(ImageResource) == 120, "ImageResource changed: update the info encoder");
+static_assert(sizeof(SamplerResource) == 20, "SamplerResource changed: update the info encoder");
 static_assert(sizeof(SampledResourcePair) == 12, "SampledResourcePair changed: update the info encoder");
 static_assert(sizeof(StageInput) == 56, "StageInput changed: update the info encoder");
 static_assert(sizeof(StageOutput) == 48, "StageOutput changed: update the info encoder");
@@ -256,7 +266,10 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.bufferWritten);
     writer.Flags(binding.samplerUnnormalized);
     writer.Flags(binding.imageUnnormalized);
+    writer.Flags(binding.imageUnnormalizedBaseLevel);
+    writer.Flags(binding.samplerIntegerBorder);
     writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
+    writer.Flags(binding.bufferRead);
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -279,7 +292,10 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.bufferWritten);
     reader.Flags(binding.samplerUnnormalized);
     reader.Flags(binding.imageUnnormalized);
+    reader.Flags(binding.imageUnnormalizedBaseLevel);
+    reader.Flags(binding.samplerIntegerBorder);
     reader.Values(binding.imageSamplers);
+    reader.Flags(binding.bufferRead);
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
@@ -291,6 +307,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.imageMetadataDword);
     writer.Value(result.runtimeImageCount);
     writer.Values(std::span<const std::uint32_t>(result.runtimeImageResources));
+    writer.Value(result.registrationModule);
     writer.List(result.vertexInputPatches, [](Writer& out, const VertexInputPatch& patch) {
         out.Value(patch.location);
         out.Value(patch.word);
@@ -316,7 +333,11 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
         out.Value(parameter.flat);
         out.Value(parameter.perVertex);
         out.Value(parameter.custom);
+        out.Value(parameter.flatP10);
     });
+    writer.Value(result.barycentricEmulation.active);
+    writer.Value(result.barycentricEmulation.smooth);
+    writer.Value(result.barycentricEmulation.linear);
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -330,6 +351,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.imageMetadataDword);
     reader.Value(result.runtimeImageCount);
     reader.Values(result.runtimeImageResources);
+    reader.Value(result.registrationModule);
     reader.List(result.vertexInputPatches, 20, [](Reader& in, VertexInputPatch& patch) {
         in.Value(patch.location);
         in.Value(patch.word);
@@ -355,7 +377,11 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         in.Value(parameter.flat);
         in.Value(parameter.perVertex);
         in.Value(parameter.custom);
+        in.Value(parameter.flatP10);
     });
+    reader.Value(result.barycentricEmulation.active);
+    reader.Value(result.barycentricEmulation.smooth);
+    reader.Value(result.barycentricEmulation.linear);
     result.variantId = 0;
 }
 
@@ -404,6 +430,7 @@ void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
     writer.Value(layout.memoryOffsetCount);
     writer.Value(layout.dispatchThreadLimit);
     writer.Value(layout.runtimeImageCount);
+    writer.Value(layout.runtimeStateDwords);
     writer.Values(std::span<const std::uint32_t>(layout.userDataRegisters));
     writer.List(layout.descriptors, [](Writer& out, const IrDescriptorBinding& descriptor) {
         out.Value(descriptor.kind);
@@ -417,6 +444,7 @@ void decodeLayout(Reader& reader, IrBindingLayout& layout) {
     reader.Value(layout.memoryOffsetCount);
     reader.Value(layout.dispatchThreadLimit);
     reader.Value(layout.runtimeImageCount);
+    reader.Value(layout.runtimeStateDwords);
     reader.Values(layout.userDataRegisters);
     reader.List(layout.descriptors, 12, [](Reader& in, IrDescriptorBinding& descriptor) {
         in.Value(descriptor.kind);
@@ -476,6 +504,9 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.depthBitsCompatible);
         out.Value(image.constantSwizzle);
         out.Value(image.constantSwizzleCompatible);
+        out.Value(image.flatVolumeCompatible);
+        out.Value(image.flatLineCompatible);
+        out.Value(image.foldTexelOffsetsOnly);
         out.Value(image.byElements);
         out.Value(image.byComponents);
         out.Value(image.packedFormat);
@@ -493,6 +524,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(sampler.forcePointFiltering);
         out.Value(sampler.depthCompare);
         out.Value(sampler.uses);
+        out.Value(sampler.foldTexelOffsetsOnly);
     });
     writer.List(info.sampledPairs, [](Writer& out, const SampledResourcePair& pair) {
         out.Value(pair.image);
@@ -524,6 +556,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
     writer.Value(info.bdaWrites);
     writer.Value(info.usesFaultBuffer);
     writer.Value(info.dispatchThreadLimit);
+    writer.Value(info.rasterPrimitive);
     encodeLayout(writer, compiled.bindings);
 }
 
@@ -552,7 +585,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
     });
-    reader.List(info.images, 74, [](Reader& in, ImageResource& image) {
+    reader.List(info.images, 75, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
         in.Value(image.firstUsePc);
         in.Value(image.resourceClass);
@@ -579,6 +612,9 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.depthBitsCompatible);
         in.Value(image.constantSwizzle);
         in.Value(image.constantSwizzleCompatible);
+        in.Value(image.flatVolumeCompatible);
+        in.Value(image.flatLineCompatible);
+        in.Value(image.foldTexelOffsetsOnly);
         in.Value(image.byElements);
         in.Value(image.byComponents);
         in.Value(image.packedFormat);
@@ -591,13 +627,14 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     bool preparedImageModes = false;
     reader.Value(preparedImageModes);
     if (preparedImageModes) ResourceMaterializer::PrepareImageModes(info);
-    reader.List(info.samplers, 15, [](Reader& in, SamplerResource& sampler) {
+    reader.List(info.samplers, 17, [](Reader& in, SamplerResource& sampler) {
         in.Value(sampler.source);
         in.Value(sampler.firstUsePc);
         in.Value(sampler.copyOf);
         in.Value(sampler.forcePointFiltering);
         in.Value(sampler.depthCompare);
         in.Value(sampler.uses);
+        in.Value(sampler.foldTexelOffsetsOnly);
     });
     reader.List(info.sampledPairs, 12, [](Reader& in, SampledResourcePair& pair) {
         in.Value(pair.image);
@@ -629,6 +666,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     reader.Value(info.bdaWrites);
     reader.Value(info.usesFaultBuffer);
     reader.Value(info.dispatchThreadLimit);
+    reader.Value(info.rasterPrimitive);
     decodeLayout(reader, compiled.bindings);
 }
 
@@ -649,6 +687,9 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
+    "APS5_NO_PERF_FRONTEND_PAIR",
+    "APS5_NO_PERF_DOM_INTERSECTION",
+    "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_RESULT_MEMO",
 };
 
@@ -888,12 +929,14 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out) {
     Writer writer(out);
     encodeArtifact(writer, result);
     encodeInvocation(writer, result);
+    writer.Value(result.workgroupMemoryDwords);
 }
 
 bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result) {
     Reader reader(bytes);
     decodeArtifact(reader, result);
     decodeInvocation(reader, result);
+    reader.Value(result.workgroupMemoryDwords);
     result.cacheHit = false;
     return reader.Done() && result.runtimeAbiVersion == RuntimeAbi::Version;
 }

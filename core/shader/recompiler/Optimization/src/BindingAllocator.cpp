@@ -68,7 +68,7 @@ bool usesGds(const IrProgram& program) {
 
 }
 
-BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const BindingLayout& layout) const {
+BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const BindingLayout& layout, bool registrationModules) const {
     IrProgramMetadata& metadata = program.Metadata();
     if (!metadata.shaderInfoComplete || metadata.bindingLayoutComplete) {
         fail(metadata.shaderInfoComplete ? "shader binding layout failed: binding layout already allocated"
@@ -89,6 +89,9 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     if (layout.pushConstantOffsetBytes + layout.pushConstantSizeBytes > NativePushConstantSize) {
         fail("shader binding layout failed: push constant range exceeds the native push constant size");
     }
+    if (layout.pushConstantSizeBytes != 0u && layout.pushConstantOffsetBytes / NativePushSlotSize != (layout.pushConstantOffsetBytes + layout.pushConstantSizeBytes - 1u) / NativePushSlotSize) {
+        fail("shader binding layout failed: push constant range crosses a stage slot");
+    }
 
     const ShaderInfo& info = program.Resources().info;
 
@@ -99,7 +102,17 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     next.dispatchThreadLimit = info.dispatchThreadLimit;
     if (info.buffers.size() > RuntimeAbi::BufferCapacity || info.images.size() > RuntimeAbi::ImageCapacity || info.samplers.size() > RuntimeAbi::SamplerHeapCapacity) fail("shader binding layout exceeds runtime metadata capacity");
     if (std::ranges::any_of(next.userDataRegisters, [](auto reg) { return reg >= RuntimeAbi::UserDataCapacity; })) fail("shader user data exceeds runtime ABI capacity");
-    if (std::ranges::any_of(info.images, [](const auto& image) { return image.indirectRoot != ImageResource::NoIndirectImage; })) next.runtimeImageCount = static_cast<std::uint32_t>(info.images.size());
+    if (registrationModules || std::ranges::any_of(info.images, [](const auto& image) { return image.indirectRoot != ImageResource::NoIndirectImage; })) next.runtimeImageCount = static_cast<std::uint32_t>(info.images.size());
+    if (registrationModules && program.Resources().stage == IrShaderStage::Pixel) next.runtimeStateDwords = RuntimeAbi::StateDwords;
+    if (registrationModules && program.Resources().stage != IrShaderStage::Pixel) {
+        std::uint32_t attributes = 0u;
+        for (const auto& block : program.Blocks()) {
+            for (const IrValue* inst : block->Instructions()) {
+                if (inst->Opcode() == IrOpcode::GetAttribute && inst->Flags<std::uint32_t>() == 1u) attributes = std::max(attributes, inst->Argument(0)->Resolve()->ImmediateU32() + 1u);
+            }
+        }
+        next.runtimeStateDwords = (attributes + RuntimeAbi::VertexSelectorsPerDword - 1u) / RuntimeAbi::VertexSelectorsPerDword;
+    }
     const auto pushSize = layout.pushConstantSizeBytes / 4u;
     next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
 
@@ -114,7 +127,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     std::array<std::vector<std::uint32_t>, ImageBindingCount> imageGroups;
     const auto place = [&](std::uint32_t i) {
         const bool dynamic = info.images[i].mipMode == ImageMipMode::DynamicStorage;
-        const std::uint32_t count = dynamic ? RuntimeAbi::StorageHeapCapacity : 1u;
+        const std::uint32_t count = dynamic ? RuntimeAbi::StorageMipSlots : 1u;
         std::array<bool, ImageBindingCount> placed{};
         for (const auto& mode : ResourceMaterializer::RuntimeImageModes(info.images[i])) {
             const auto group = ImageBindingIndex(DescriptorBindingForImage(mode));

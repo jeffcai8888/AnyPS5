@@ -75,13 +75,30 @@ extern "C" int APS5_VABI remove_nid_postfix(const char* path) {
     if (!*path) { errno = 2; return -1; }
     try {
         const auto resolved = ResolvePath_nid_no_patch(path);
+        if (FinalPathComponentIsDot_nid_no_patch(path)) {
+            std::error_code statusError;
+            const auto status = std::filesystem::status(resolved, statusError);
+            if (statusError) { errno = FilesystemError(statusError); return -1; }
+            if (!std::filesystem::exists(status)) { errno = 2; return -1; }
+            if (!std::filesystem::is_directory(status)) { errno = 20; return -1; }
+            errno = 22;
+            return -1;
+        }
         std::error_code error;
 #ifdef _WIN32
         const DWORD attributes = GetFileAttributesW(resolved.c_str());
         bool removed = false;
         if (attributes != INVALID_FILE_ATTRIBUTES) {
+            const DWORD writable = attributes & ~FILE_ATTRIBUTE_READONLY;
+            const bool unlocked = writable != attributes &&
+                SetFileAttributesW(resolved.c_str(), writable ? writable : FILE_ATTRIBUTE_NORMAL);
             removed = (attributes & FILE_ATTRIBUTE_DIRECTORY) ?
                 RemoveDirectoryW(resolved.c_str()) != 0 : DeleteFileW(resolved.c_str()) != 0;
+            if (!removed && unlocked) {
+                const DWORD nativeError = GetLastError();
+                SetFileAttributesW(resolved.c_str(), attributes);
+                SetLastError(nativeError);
+            }
         }
         if (!removed) {
             const DWORD nativeError = GetLastError();

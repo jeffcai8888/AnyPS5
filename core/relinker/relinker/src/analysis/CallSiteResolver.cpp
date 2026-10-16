@@ -2,8 +2,10 @@
 #include <codegen/IInstructionScanner.hpp>
 #include <codegen/x86/X64OpcodeConstants.hpp>
 #include <cstring>
+#include <limits>
 #include <memory>
-#include <map>
+#include <algorithm>
+#include <utility>
 
 namespace Relinker {
 
@@ -26,7 +28,8 @@ bool isRipRelativeFF(const std::vector<std::uint8_t>& text, const Codegen::Instr
             std::uint8_t modrm = text[cur + 1];
             std::uint8_t mod = (modrm >> ModRmModShift) & ModRmModMask;
             std::uint8_t rm = modrm & ModRmRmMask;
-            return mod == ModRmModIndirect && rm == ModRmRmRipRelative;
+            const auto operation = (modrm >> ModRmRegShift) & ModRmRegMask;
+            return mod == ModRmModIndirect && rm == ModRmRmRipRelative && (operation >= 2 && operation <= 6);
         }
         break;
     }
@@ -69,16 +72,22 @@ public:
     std::vector<FileByteOffset> ResolveCallSites(const std::vector<std::uint8_t>& textSection, FileByteOffset textSectionVAddr, VirtualAddress targetGotOrPltAddress, ByteCount targetGotOrPltSize) override;
 private:
     const std::vector<std::uint8_t>* _cachedTextPtr = nullptr;
-    std::multimap<VirtualAddress, FileByteOffset> _cachedTargetToInstr;
+    std::vector<std::pair<VirtualAddress, FileByteOffset>> _cachedTargetToInstr;
     FileByteOffset _cachedTextVAddr = 0;
 };
 
 std::vector<FileByteOffset> CallSiteResolver::ResolveCallSites(const std::vector<std::uint8_t>& textSection, const FileByteOffset textSectionVAddr, const VirtualAddress targetGotOrPltAddress, const ByteCount targetGotOrPltSize) {
+    if (targetGotOrPltSize > std::numeric_limits<VirtualAddress>::max() - targetGotOrPltAddress)
+        throw RelinkerException("Relocation target range exceeds the address space");
     if (textSection.empty()) return {};
     if (_cachedTextPtr != &textSection || _cachedTextVAddr != textSectionVAddr) {
         auto scanner = Codegen::MakeInstructionScanner();
         auto instructions = scanner->ScanCodeSection(textSection, 0, textSection.size());
         _cachedTargetToInstr.clear();
+        const auto referenceCount = std::count_if(instructions.begin(), instructions.end(), [&](const auto& match) {
+            return isRipRelativeFF(textSection, match) || isRipRelativeMov64(textSection, match);
+        });
+        _cachedTargetToInstr.reserve(static_cast<std::size_t>(referenceCount));
         for (const auto& m : instructions) {
             std::size_t dispOff = 0;
             if (isRipRelativeFF(textSection, m))
@@ -91,15 +100,20 @@ std::vector<FileByteOffset> CallSiteResolver::ResolveCallSites(const std::vector
             std::int32_t disp = readDisp32(textSection, dispOff);
             VirtualAddress instrEnd = textSectionVAddr + m.Offset + static_cast<VirtualAddress>(m.Length);
             VirtualAddress target = static_cast<VirtualAddress>(static_cast<std::int64_t>(instrEnd) + disp);
-            _cachedTargetToInstr.emplace(target, m.Offset);
+            _cachedTargetToInstr.emplace_back(target, m.Offset);
         }
+        std::sort(_cachedTargetToInstr.begin(), _cachedTargetToInstr.end());
         _cachedTextPtr = &textSection;
         _cachedTextVAddr = textSectionVAddr;
     }
 
     std::vector<FileByteOffset> sites;
-    auto lower = _cachedTargetToInstr.lower_bound(targetGotOrPltAddress);
-    auto upper = _cachedTargetToInstr.lower_bound(targetGotOrPltAddress + targetGotOrPltSize);
+    const auto findTarget = [&](VirtualAddress target) {
+        return std::lower_bound(_cachedTargetToInstr.begin(), _cachedTargetToInstr.end(),
+            std::pair<VirtualAddress, FileByteOffset>{target, 0});
+    };
+    auto lower = findTarget(targetGotOrPltAddress);
+    auto upper = findTarget(targetGotOrPltAddress + targetGotOrPltSize);
     for (auto it = lower; it != upper; ++it)
         sites.push_back(textSectionVAddr + it->second);
     return sites;

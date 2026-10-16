@@ -5,13 +5,14 @@ function(add_shader_recompiler target runtimeTarget)
     endif()
 
     if(ANYPS5_ENABLE_SPIRV_TOOLS AND NOT TARGET SPIRV-Tools-opt)
-        set(SPIRV-Headers_SOURCE_DIR "${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Headers")
+        set(SPIRV-Headers_SOURCE_DIR "${ANYPS5_SPIRV_HEADERS_SOURCE_DIR}")
         set(SPIRV_SKIP_EXECUTABLES ON)
         set(SPIRV_SKIP_TESTS ON)
         set(SPIRV_TOOLS_BUILD_STATIC ON)
         set(SPIRV_WERROR OFF)
         set(BUILD_SHARED_LIBS OFF)
         add_subdirectory("${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Tools" "${CMAKE_BINARY_DIR}/3rdparty/SPIRV-Tools" EXCLUDE_FROM_ALL)
+        include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/PatchSpirvTools.cmake")
     endif()
 
     if(NOT TARGET glslang)
@@ -36,6 +37,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Recompiler.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderDiskCache.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/RectListShaders.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/BarycentricGeometryShader.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RdnaDecoder/src/RdnaOpcode.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RdnaDecoder/src/RdnaProgram.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RdnaDecoder/src/RdnaInstructionDecoder.cpp
@@ -96,8 +98,10 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SsaBuilder/SsaRegisterStateCleanup.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ConstantFolder.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DeadCodeEliminator.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/HostInterpolationChecker.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ReadLaneEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/MaskedSelectEliminator.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/TessellationLowering.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ResourceTracker.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ResourceMaterializer.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/BindingAllocator.cpp
@@ -105,6 +109,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DescriptorBindingBuilder.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ShaderInfoCollector.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SharedMemoryBarrierInserter.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DenormalFlushEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtAddressArithmetic.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtDiagnostics.cpp
@@ -154,8 +159,8 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Translation/include
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/include
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/include
-            ${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Headers/include
-            ${PROJECT_SOURCE_DIR}/3rdparty/glslang
+            ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR}
+            ${ANYPS5_GLSLANG_INCLUDE_DIRS}
     )
 
     target_compile_features(${target} PUBLIC cxx_std_20)
@@ -184,30 +189,36 @@ function(add_shader_recompiler target runtimeTarget)
     list(REMOVE_ITEM shaderCacheGuardSources ${shaderCacheRecompilerSources})
 
     find_package(Git QUIET)
-    set(shaderCacheSubmodules "${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Headers" "${PROJECT_SOURCE_DIR}/3rdparty/glslang")
-    if(ANYPS5_ENABLE_SPIRV_TOOLS)
-        list(APPEND shaderCacheSubmodules "${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Tools")
-    endif()
     set(shaderCacheSubmoduleStamps)
-    foreach(submodule IN LISTS shaderCacheSubmodules)
-        list(APPEND shaderCacheSubmoduleStamps "${submodule}/CMakeLists.txt")
-        if(NOT GIT_FOUND)
-            continue()
+    if(NOT ANYPS5_USE_SYSTEM_DEPS)
+        set(shaderCacheSubmodules "${ANYPS5_SPIRV_HEADERS_SOURCE_DIR}" "${ANYPS5_GLSLANG_SOURCE_DIR}")
+        if(ANYPS5_ENABLE_SPIRV_TOOLS)
+            list(APPEND shaderCacheSubmodules "${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Tools")
         endif()
-        foreach(ref IN ITEMS HEAD refs/heads)
-            execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${submodule}" rev-parse --path-format=absolute --git-path ${ref}
-                    OUTPUT_VARIABLE stamp OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE status ERROR_QUIET)
-            if(status EQUAL 0 AND EXISTS "${stamp}" AND NOT IS_DIRECTORY "${stamp}")
-                list(APPEND shaderCacheSubmoduleStamps "${stamp}")
+        foreach(submodule IN LISTS shaderCacheSubmodules)
+            list(APPEND shaderCacheSubmoduleStamps "${submodule}/CMakeLists.txt")
+            if(NOT GIT_FOUND)
+                continue()
             endif()
+            foreach(ref IN ITEMS HEAD refs/heads)
+                execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${submodule}" rev-parse --path-format=absolute --git-path ${ref}
+                        OUTPUT_VARIABLE stamp OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE status ERROR_QUIET)
+                if(status EQUAL 0 AND EXISTS "${stamp}" AND NOT IS_DIRECTORY "${stamp}")
+                    list(APPEND shaderCacheSubmoduleStamps "${stamp}")
+                endif()
+            endforeach()
         endforeach()
-    endforeach()
+    endif()
 
     get_target_property(shaderCacheIncludeDirectories ${target} INCLUDE_DIRECTORIES)
     string(TOUPPER "${CMAKE_BUILD_TYPE}" shaderCacheBuildType)
     set(shaderCacheExtra "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_BUILD_TYPE} spirv-tools=${ANYPS5_ENABLE_SPIRV_TOOLS} ${CMAKE_SYSTEM_PROCESSOR} flags=${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${shaderCacheBuildType}}")
+    if(ANYPS5_USE_SYSTEM_DEPS)
+        string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
+    endif()
     set(shaderCacheReviewedNames
             AnalyzeExternalSwappcCalls
+            BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources
@@ -216,10 +227,13 @@ function(add_shader_recompiler target runtimeTarget)
             DepthBitsTextureWidth
             FuseExternalCalls
             HashBytes
+            IsDirectBranchOpcode
             PixelInput
             PixelInputBit
             RayTracingStrict
             RayTracingMiss
+            RdnaOpcode
+            RdnaOperandKind
             ReadWholeFile
             Recompile
             RecompileCacheKey::ContextHash
@@ -230,6 +244,7 @@ function(add_shader_recompiler target runtimeTarget)
             MatchesPreparedShader
             GetPreparedArtifact
             MaterializeShader
+            RegistrationResult
             ResolveSource
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion
@@ -239,6 +254,11 @@ function(add_shader_recompiler target runtimeTarget)
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned
+            UnresolvableSwappcTarget
+            ValidateAndOptimizeSpirv
+            FindUserDataCalls
+            UserDataCalleeLength
+            LinkUserDataCalls
             WriteFileAtomically
     )
     set(shaderCacheManifest)

@@ -6,6 +6,7 @@
 #include <thread>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 #include "SDL.h"
 #include "SDL_vulkan.h"
@@ -27,6 +28,9 @@
 #include "prx/libc/include/Shutdown.hpp"
 
 namespace {
+
+constexpr std::uint64_t FLIP_ROOM_WAIT_MICROS = 60000000;
+constexpr std::uint64_t PRESENT_POLL_MICROS = 10000;
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("VideoOut: ") + reason);
@@ -64,6 +68,30 @@ void checkConfig(const VideoOutConfig& cfg) {
     cfg.Check();
 }
 
+void resolveFlipBuffer(FlipRequest& request, const VideoOutConfig& cfg) {
+    if (request.index < 0) {
+        request.width = cfg.width;
+        request.height = cfg.height;
+        return;
+    }
+    request.buffer = cfg.buffers[request.index];
+    if (!request.buffer.Occupied()) {
+        static std::array<std::atomic<bool>, VIDEO_OUT_BUFFER_NUM_MAX> reported{};
+        if (!reported[request.index].exchange(true)) std::fprintf(stderr, "[videoout] GPU flip of unregistered buffer %d on handle %u presents black\n", request.index, request.outputHandle);
+        request.unregistered = true;
+        request.width = cfg.width;
+        request.height = cfg.height;
+        return;
+    }
+    require(request.buffer.groupIndex < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX, "invalid buffer group");
+    if (!request.groupCaptured) request.group = cfg.groups[request.buffer.groupIndex];
+    require(request.group.occupied, "buffer group is not registered");
+    require(request.buffer.dataAddress != 0, "null registered buffer address");
+    static_cast<void>(DescribeVideoOutBuffer(request.buffer, request.group));
+    request.width = request.group.attribute.width;
+    request.height = request.group.attribute.height;
+}
+
 class RenderingWait final : public AgcDriver::IRenderingWait {
     std::shared_ptr<VideoOutConfig> _config;
     std::uint32_t _index;
@@ -74,10 +102,10 @@ public:
     void Wait() override {
         std::unique_lock lock(_config->mutex);
         _config->vblankCond.wait(lock, _config->shutdownToken, [&] {
-            return _config->failure || _config->closing || !_config->opened ||
+            return _config->failure || _config->Closed() ||
                 _config->bufferReuse[_index].IsComplete(_ticket);
         });
-        checkConfig(*_config);
+        _config->CheckAlive();
     }
 };
 
@@ -94,7 +122,7 @@ public:
 
     void WaitForFlipRoom() override {
         std::unique_lock queueLock(queue->mutex);
-        const bool room = queue->changed.wait_for(queueLock, std::chrono::seconds(60), [&] {
+        const bool room = queue->changed.WaitUntil(queueLock, TimedWait::DeadlineNanos(FLIP_ROOM_WAIT_MICROS), [&] {
             return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY;
         });
         if (queue->failure) std::rethrow_exception(queue->failure);
@@ -118,26 +146,16 @@ public:
         if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
         std::lock_guard lock(cfg->mutex);
         checkConfig(*cfg);
-        if (info.index >= 0) {
-            request->buffer = cfg->buffers[info.index];
-            require(request->buffer.Occupied(), "flip buffer is not registered");
-            require(request->buffer.groupIndex < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX, "invalid buffer group");
-            request->group = cfg->groups[request->buffer.groupIndex];
-            require(request->group.occupied, "buffer group is not registered");
-            require(request->buffer.dataAddress != 0, "null registered buffer address");
-            static_cast<void>(DescribeVideoOutBuffer(request->buffer, request->group));
-            request->width = request->group.attribute.width;
-            request->height = request->group.attribute.height;
-        } else {
-            request->width = cfg->width;
-            request->height = cfg->height;
-        }
         request->generation = cfg->generation;
         request->flipRate = cfg->flipRate;
         if (info.index >= 0) request->reuseTicket = cfg->bufferReuse[info.index].Reserve();
         ++queue->reservations;
         ++cfg->flipStatus.flipPendingNum;
         if (info.index >= 0) ++cfg->bufferPending[info.index];
+        if (info.index >= 0 && cfg->buffers[info.index].Occupied() && cfg->buffers[info.index].groupIndex < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX && cfg->groups[cfg->buffers[info.index].groupIndex].occupied) {
+            request->group = cfg->groups[cfg->buffers[info.index].groupIndex];
+            request->groupCaptured = true;
+        }
         request->reserved = true;
         return request;
     }
@@ -153,7 +171,7 @@ public:
             if (!cfg->failure) cfg->failure = error;
             cfg->vblankCond.notify_all();
         }
-        queue->changed.notify_all();
+        queue->changed.NotifyAll();
     }
 
 private:
@@ -166,15 +184,27 @@ private:
 FlipRequest::~FlipRequest() {
     if (!reserved) return;
     std::lock_guard lock(cfg->mutex);
-    if (!terminal) {
-        --cfg->flipStatus.flipPendingNum;
-        --queue->reservations;
-        if (index >= 0) {
-            --cfg->bufferPending[index];
-            cfg->bufferReuse[index].Complete(reuseTicket);
-        }
-        cfg->vblankCond.notify_all();
+    ReleaseLocked();
+}
+
+void FlipRequest::ReleaseLocked() noexcept {
+    if (!reserved || terminal) return;
+    --cfg->flipStatus.flipPendingNum;
+    --queue->reservations;
+    if (index >= 0) {
+        --cfg->bufferPending[index];
+        cfg->bufferReuse[index].Complete(reuseTicket);
     }
+    terminal = true;
+    cfg->vblankCond.notify_all();
+}
+
+void FlipRequest::Cancel() noexcept {
+    {
+        std::lock_guard lock(cfg->mutex);
+        ReleaseLocked();
+    }
+    queue->changed.NotifyAll();
 }
 
 void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameTiming) {
@@ -187,14 +217,19 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
         if (queue->failure) std::rethrow_exception(queue->failure);
         if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
         std::lock_guard lock(cfg->mutex);
-        checkConfig(*cfg);
+        cfg->CheckAlive();
+        if (cfg->Closed()) {
+            ReleaseLocked();
+            return;
+        }
         require(reserved && !ready && !terminal && cfg->generation == generation, "invalid flip readiness transition");
+        resolveFlipBuffer(*this, *cfg);
         readiness.Mark("locks_validate");
         queuedAt = AgcDriver::FrameTiming::Clock::now();
         queue->requests.push_back(shared_from_this());
         ready = true;
     }
-    queue->changed.notify_all();
+    queue->changed.NotifyAll();
     // The worker is done once the request is queued: hardware does not stall the command processor
     // on a flip, and the title observes completion through flipPendingNum, which processFlip drops
     // once the frame's GPU work and its presentation have completed (see Driver::Present). A
@@ -212,17 +247,8 @@ void FlipRequest::Fail(std::exception_ptr error) noexcept {
     if (!error) std::terminate();
     std::lock_guard lock(cfg->mutex);
     if (!cfg->failure) cfg->failure = error;
-    if (reserved && !terminal) {
-        --cfg->flipStatus.flipPendingNum;
-        --queue->reservations;
-        if (index >= 0) {
-            --cfg->bufferPending[index];
-            cfg->bufferReuse[index].Complete(reuseTicket);
-        }
-        terminal = true;
-    }
-    cfg->vblankCond.notify_all();
-    queue->changed.notify_all();
+    ReleaseLocked();
+    queue->changed.NotifyAll();
 }
 
 VideoOutDriver& VideoOutDriver::Get() {
@@ -239,19 +265,27 @@ VideoOutDriver::VideoOutDriver() {
         AgcDriverWaitIdle_nid_postfix();
         std::promise<void> started;
         auto attached = started.get_future();
-        presentThread = std::jthread([this, &started](std::stop_token token) { presentLoop(token, started); });
+        presentThread = std::jthread([this, &started](std::stop_token token) {
+            try {
+                AgcDriverRaiseWorkerThreadPriority_nid_postfix("presenter");
+            } catch (...) {
+                started.set_exception(std::current_exception());
+                return;
+            }
+            presentLoop(token, started);
+        });
         attached.get();
         vblankThread = std::jthread([this](std::stop_token token) { vblankLoop(token); });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
     } catch (...) {
         if (vblankThread.joinable()) {
             vblankThread.request_stop();
-            flipQueue->changed.notify_all();
+            flipQueue->changed.NotifyAll();
             vblankThread.join();
         }
         if (presentThread.joinable()) {
             presentThread.request_stop();
-            flipQueue->changed.notify_all();
+            flipQueue->changed.NotifyAll();
             presentThread.join();
         }
         SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER);
@@ -274,7 +308,7 @@ void VideoOutDriver::Shutdown() {
     }
     presentThread.request_stop();
     vblankThread.request_stop();
-    flipQueue->changed.notify_all();
+    flipQueue->changed.NotifyAll();
     presentThread.join();
     vblankThread.join();
     {
@@ -308,6 +342,7 @@ int VideoOutDriver::Open(int busType) {
     }
     auto cfg = std::make_shared<VideoOutConfig>();
     cfg->generation = generation;
+    cfg->busType = busType;
     cfg->opened = true;
     cfg->flipStatus.flipArg = -1;
     cfg->flipStatus.currentBuffer = -1;
@@ -349,7 +384,7 @@ bool VideoOutDriver::close(int handle) {
     cfg->outputModeEvents.clear();
     cfg->vrrStatusEvents.clear();
     cfg->vblankCond.notify_all();
-    flipQueue->changed.notify_all();
+    flipQueue->changed.NotifyAll();
     return true;
 }
 
@@ -412,13 +447,34 @@ void VideoOutDriver::triggerEvents(VideoOutConfig& cfg, int eventKind, void* tri
     }
 }
 
-void VideoOutDriver::vblankEnd() {
+bool VideoOutDriver::SupportsHighFrameRate() {
+    return GetDisplayRefreshRate() >= 120;
+}
+
+int VideoOutDriver::GetDisplayRefreshRate() {
+    return displayRefreshRate.load();
+}
+
+void VideoOutDriver::updateDisplayRefreshRate() {
+    const int display = SDL_GetWindowDisplayIndex(window.Handle());
+    if (display < 0) throw std::runtime_error(std::string("SDL_GetWindowDisplayIndex failed: ") + SDL_GetError());
+    SDL_DisplayMode mode{};
+    if (SDL_GetCurrentDisplayMode(display, &mode) != 0) throw std::runtime_error(std::string("SDL_GetCurrentDisplayMode failed: ") + SDL_GetError());
+    displayRefreshRate.store(mode.refresh_rate);
+}
+
+void VideoOutDriver::vblankEnd(std::uint64_t tick) {
     std::lock_guard lock(mutex);
     for (const auto& cfg : contexts) {
         if (!cfg) continue;
         std::lock_guard cfgLock(cfg->mutex);
         if (!cfg->opened || cfg->failure) continue;
+        if (cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ && tick % 2 != 0) continue;
         require(cfg->vblankStatus.count != std::numeric_limits<uint64_t>::max(), "vblank counter overflow");
+        ++cfg->preVblankStatus.count;
+        cfg->preVblankStatus.processTime = sceKernelGetProcessTime();
+        cfg->preVblankStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
+        triggerEvents(*cfg, VIDEO_OUT_EVENT_PRE_VBLANK_START, reinterpret_cast<void*>(cfg->preVblankStatus.count));
         ++cfg->vblankStatus.count;
         cfg->vblankStatus.processTime = sceKernelGetProcessTime();
         cfg->vblankStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
@@ -433,7 +489,12 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     {
         std::unique_lock lock(req.cfg->mutex);
         timing.Mark("config_mutex_wait");
-        checkConfig(*req.cfg);
+        req.cfg->CheckAlive();
+        if (req.cfg->Closed()) {
+            req.ReleaseLocked();
+            return;
+        }
+        require(req.cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ || SupportsHighFrameRate(), "display no longer supports 119.88 Hz output");
         require(req.ready && !req.terminal && req.generation == req.cfg->generation, "stale or incomplete flip request");
         const auto interval = static_cast<uint64_t>(req.flipRate + 1);
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
@@ -441,34 +502,52 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         timing.Mark("validate");
         req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
-        checkConfig(*req.cfg);
+        req.cfg->CheckAlive();
+        if (req.cfg->Closed()) {
+            req.ReleaseLocked();
+            return;
+        }
         req.cfg->lastFlipVblank = req.cfg->vblankStatus.count;
     }
     require(req.width != 0 && req.height != 0 && req.width <= static_cast<uint32_t>(std::numeric_limits<int>::max()) && req.height <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "invalid window dimensions");
-    window.Ensure(req.width, req.height);
-    const auto extensions = windowExtensions(window.Handle());
-    const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
-    timing.Mark("window_prepare");
-    const auto gpuReady = [](void* context) {
-        auto& request = *static_cast<FlipRequest*>(context);
-        std::lock_guard lock(request.cfg->mutex);
-        checkConfig(*request.cfg);
-        require(!request.terminal && !request.gpuComplete, "invalid GPU completion transition");
-        request.gpuComplete = true;
-        request.cfg->vblankCond.notify_all();
-    };
-    if (req.index >= 0) {
-        const auto display = DescribeVideoOutBuffer(req.buffer, req.group);
-        AgcDriverPresentBuffer_nid_postfix(target, display, gpuReady, &req);
+    if (req.cfg->busType == VIDEO_OUT_BUS_TYPE_OVERLAY) {
+        std::lock_guard lock(req.cfg->mutex);
+        req.cfg->CheckAlive();
+        if (!req.cfg->Closed()) {
+            require(!req.terminal && !req.gpuComplete, "invalid GPU completion transition");
+            req.gpuComplete = true;
+        }
     } else {
-        AgcDriverPresentClear_nid_postfix(target, req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
+        window.Ensure(req.width, req.height);
+        const auto extensions = windowExtensions(window.Handle());
+        const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
+        timing.Mark("window_prepare");
+        const auto gpuReady = [](void* context) {
+            auto& request = *static_cast<FlipRequest*>(context);
+            std::lock_guard lock(request.cfg->mutex);
+            request.cfg->CheckAlive();
+            if (request.cfg->Closed()) return;
+            require(!request.terminal && !request.gpuComplete, "invalid GPU completion transition");
+            request.gpuComplete = true;
+            request.cfg->vblankCond.notify_all();
+        };
+        if (req.index >= 0 && !req.unregistered) {
+            const auto display = DescribeVideoOutBuffer(req.buffer, req.group);
+            AgcDriverPresentBuffer_nid_postfix(target, display, gpuReady, &req);
+        } else {
+            AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
+        }
+        timing.Mark("present");
+        window.UpdateTitle();
+        timing.Mark("window_title");
     }
-    timing.Mark("present");
-    window.UpdateTitle();
-    timing.Mark("window_title");
     std::lock_guard lock(req.cfg->mutex);
     timing.Mark("completion_mutex_wait");
-    checkConfig(*req.cfg);
+    req.cfg->CheckAlive();
+    if (req.cfg->Closed()) {
+        req.ReleaseLocked();
+        return;
+    }
     require(!req.terminal && req.cfg->generation == req.generation, "flip cancelled during presentation");
     require(req.gpuComplete, "flip submitted before GPU completion");
     require(req.cfg->flipStatus.count != std::numeric_limits<uint64_t>::max(), "flip counter overflow");
@@ -494,6 +573,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {
     try {
         window.Ensure(VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT);
+        updateDisplayRefreshRate();
         const auto extensions = windowExtensions(window.Handle());
         AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
     } catch (...) {
@@ -516,7 +596,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
-                flipQueue->changed.wait_for(lock, std::chrono::milliseconds(10), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); });
+                flipQueue->changed.WaitUntil(lock, TimedWait::DeadlineNanos(PRESENT_POLL_MICROS), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); });
                 if (flipQueue->failure) std::rethrow_exception(flipQueue->failure);
                 if (token.stop_requested()) break;
                 if (!flipQueue->requests.empty()) {
@@ -538,6 +618,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 }
             }
             padInput.Update();
+            updateDisplayRefreshRate();
             if (current) {
                 require(current->timing != nullptr, "missing presentation timing");
                 const auto dequeued = AgcDriver::FrameTiming::Clock::now();
@@ -575,7 +656,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
             }
             if (current) {
                 current.reset();
-                flipQueue->changed.notify_all();
+                flipQueue->changed.NotifyAll();
             }
         }
     } catch (const ProcessShutdown&) {
@@ -615,7 +696,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
 }
 
 void VideoOutDriver::vblankLoop(std::stop_token token) {
-    using Frame = std::chrono::duration<int64_t, std::ratio<1001, 60000>>;
+    using Frame = std::chrono::duration<int64_t, std::ratio<1001, 120000>>;
     const auto start = std::chrono::steady_clock::now();
     try {
         for (int64_t frame = 1; !token.stop_requested(); ++frame) {
@@ -626,7 +707,7 @@ void VideoOutDriver::vblankLoop(std::stop_token token) {
                 std::lock_guard lock(flipQueue->mutex);
                 if (token.stop_requested() || flipQueue->failure) return;
             }
-            vblankEnd();
+            vblankEnd(static_cast<std::uint64_t>(frame));
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[videoout] vblank failed: %s\n", error.what());

@@ -34,7 +34,6 @@ ShaderDeviceProfile::ShaderDeviceProfile(const ShaderRecompiler::SpirvTarget& ta
     Require(target.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version, "shader device profile has an incompatible BDA ABI");
     Require(bda != nullptr && bda->bufferDeviceAddress == VK_TRUE && core.shaderInt64 == VK_TRUE, "shader runtime requires enabled bufferDeviceAddress and shaderInt64");
     Require(bytes != nullptr && bytes->storageBuffer8BitAccess == VK_TRUE, "shader runtime requires enabled storageBuffer8BitAccess");
-    Require(nullDescriptors, "shader runtime requires enabled nullDescriptor");
     Require(core.vertexPipelineStoresAndAtomics == VK_TRUE && core.fragmentStoresAndAtomics == VK_TRUE, "shader runtime requires enabled graphics stores and atomics");
     Require(limits.maxPushConstantsSize >= ShaderRecompiler::RuntimeAbi::PushConstantDwords * sizeof(std::uint32_t) && limits.maxBoundDescriptorSets > ShaderRecompiler::RuntimeAbi::DescriptorSet, "shader runtime ABI exceeds device limits");
     Require(limits.maxStorageBufferRange >= sizeof(ShaderRecompiler::RuntimeAbi::ShaderData), "shader runtime ShaderData exceeds device limits");
@@ -48,6 +47,7 @@ ShaderDeviceProfile::ShaderDeviceProfile(const ShaderRecompiler::SpirvTarget& ta
     checkFeature(spv::CapabilityFloat64, core.shaderFloat64 == VK_TRUE, "shaderFloat64");
     checkFeature(spv::CapabilityTessellation, core.tessellationShader == VK_TRUE, "tessellationShader");
     checkFeature(spv::CapabilityImageGatherExtended, core.shaderImageGatherExtended == VK_TRUE, "shaderImageGatherExtended");
+    checkFeature(spv::CapabilityClipDistance, core.shaderClipDistance == VK_TRUE, "shaderClipDistance");
     checkFeature(spv::CapabilityMinLod, core.shaderResourceMinLod == VK_TRUE, "shaderResourceMinLod");
     checkFeature(spv::CapabilityStorageImageMultisample, core.shaderStorageImageMultisample == VK_TRUE, "shaderStorageImageMultisample");
     checkFeature(spv::CapabilityStorageImageReadWithoutFormat, core.shaderStorageImageReadWithoutFormat == VK_TRUE, "shaderStorageImageReadWithoutFormat");

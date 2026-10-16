@@ -5,7 +5,9 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -24,6 +26,7 @@ class Recorder;
 class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
+class PlaceholderImages;
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -52,10 +55,23 @@ struct DeviceFunctions {
     PFN_vkCmdDispatchIndirect cmdDispatchIndirect = nullptr;
     PFN_vkCmdBeginRenderPass cmdBeginRenderPass = nullptr;
     PFN_vkCmdEndRenderPass cmdEndRenderPass = nullptr;
+    PFN_vkCmdBeginRenderingKHR cmdBeginRendering = nullptr;
+    PFN_vkCmdEndRenderingKHR cmdEndRendering = nullptr;
     PFN_vkCmdSetViewport cmdSetViewport = nullptr;
     PFN_vkCmdSetScissor cmdSetScissor = nullptr;
     PFN_vkCmdSetDepthBounds cmdSetDepthBounds = nullptr;
     PFN_vkCmdSetDepthBias cmdSetDepthBias = nullptr;
+    PFN_vkCmdSetCullModeEXT cmdSetCullMode = nullptr;
+    PFN_vkCmdSetFrontFaceEXT cmdSetFrontFace = nullptr;
+    PFN_vkCmdSetDepthTestEnableEXT cmdSetDepthTestEnable = nullptr;
+    PFN_vkCmdSetDepthWriteEnableEXT cmdSetDepthWriteEnable = nullptr;
+    PFN_vkCmdSetDepthCompareOpEXT cmdSetDepthCompareOp = nullptr;
+    PFN_vkCmdSetDepthBoundsTestEnableEXT cmdSetDepthBoundsTestEnable = nullptr;
+    PFN_vkCmdSetStencilTestEnableEXT cmdSetStencilTestEnable = nullptr;
+    PFN_vkCmdSetStencilOpEXT cmdSetStencilOp = nullptr;
+    PFN_vkCmdSetStencilCompareMask cmdSetStencilCompareMask = nullptr;
+    PFN_vkCmdSetStencilWriteMask cmdSetStencilWriteMask = nullptr;
+    PFN_vkCmdSetStencilReference cmdSetStencilReference = nullptr;
     PFN_vkCmdBindVertexBuffers cmdBindVertexBuffers = nullptr;
     PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer = nullptr;
     PFN_vkCmdDraw cmdDraw = nullptr;
@@ -125,8 +141,11 @@ struct Context {
     bool occlusionQueryPrecise = false;
     bool depthBounds = false;
     bool depthBiasClamp = false;
+    bool dualSrcBlend = false;
     bool samplerFilterMinmax = false;
+    bool nonSeamlessCubeMap = false;
     bool conservativeRasterization = false;
+    bool meshWave32 = false;
     VkBuffer emptyBuffer = VK_NULL_HANDLE;
     // The device's list of recorded dispatches whose copied written buffers await a CPU write-back
     // (VulkanDevice's State::copiedWriters; the draw counterpart is DrawCopiedWriters): an indirect
@@ -141,12 +160,22 @@ struct Context {
     bool imageInt64Atomics = false;
     bool geometryShader = false;
     bool sampleRateShading = false;
+    bool shaderClipDistance = false;
+    bool shaderCullDistance = false;
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
+    const PlaceholderImages* placeholderImages = nullptr;
+    bool viewportIndexLayer = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool graphicsPipelineLibrary = false;
+    bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;
+    bool provokingVertexLast = false;
+    bool provokingVertexModePerPipeline = false;
+    bool singlePassStorage = false;
+    VkSampleCountFlags sampleLocationSampleCounts = 0;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
@@ -170,7 +199,34 @@ struct Context {
         }
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
     }
+
+    std::uint32_t DeviceMemoryType(std::uint32_t mask, VkDeviceSize bytes, const char* what) const {
+        const auto type = MemoryType(mask, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return type;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        properties.pNext = &reported;
+        memoryProperties2(physical, &properties);
+        const auto heap = memory.memoryTypes[type].heapIndex;
+        const auto budget = reported.heapBudget[heap];
+        const auto usage = reported.heapUsage[heap];
+        if (budget == 0 || (usage < budget && bytes <= budget - usage)) return type;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            if ((mask & (1u << i)) == 0 || (memory.memoryHeaps[memory.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
+            static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
+            const auto count = placements.fetch_add(1) + 1;
+            const auto total = placedBytes.fetch_add(bytes) + bytes;
+            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+            return i;
+        }
+        return type;
+    }
 };
+
+inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
+    if (context.graphicsPipelineLibrary) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
+    else context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
+}
 
 }
 

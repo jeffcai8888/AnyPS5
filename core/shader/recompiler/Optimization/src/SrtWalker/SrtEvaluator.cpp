@@ -143,7 +143,8 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         const auto stride = (static_cast<std::uint32_t>(high) >> 16u) & 0x3fffu;
         const auto size = stride == 0u ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(records)) : static_cast<std::uint64_t>(stride) * static_cast<std::uint32_t>(records);
         if (aligned > size || size - aligned < sizeof(std::uint32_t)) {
-            return false;
+            result = 0;
+            return true;
         }
         address = ((base & ~std::uint64_t {3}) + byteOffset) & ~std::uint64_t {3};
     } else {
@@ -151,6 +152,19 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         if (!AddSignedAddress(base & ~std::uint64_t {3}, relative, address)) {
             return false;
         }
+    }
+    if (_nullRoots != nullptr && base == 0 && !LoadedFromMemory(*handle)) {
+        ++*_nullRoots;
+        result = 0;
+        return true;
+    }
+    // A root the code spells as an immediate address names a table the system maps, such as a hook
+    // table. When the emulator leaves it unmapped it reads as zero, an empty table, like a null root.
+    const bool fixedRoot = handle->Argument(0)->Resolve()->HasImmediate() && handle->Argument(1)->Resolve()->HasImmediate();
+    if (fixedRoot && base != 0 && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t))) {
+        if (_nullRoots != nullptr) ++*_nullRoots;
+        result = 0;
+        return true;
     }
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle)) {
         *_inaccessible = {&inst, address};
@@ -163,14 +177,7 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
     std::uint32_t word = 0;
     if (_runtime.readMemory != nullptr) {
         if (!_runtime.readMemory(_runtime.userContext, address, &word)) {
-            // The hardware answers scalar loads through null or unmapped addresses with zero; the
-            // shader's own comparisons and fallback paths (an optional pointer with a direct buffer
-            // read) then specialize on that. Descriptor-bounded reads keep failing instead so the
-            // dynamic path covers an unreadable buffer.
-            if (inst.Opcode() != IrOpcode::LoadAddressU32) {
-                return false;
-            }
-            word = 0;
+            return false;
         }
     } else {
         std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
@@ -199,6 +206,7 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::ReadFirstLane: {
             Evaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, inst.Argument(1));
             active.ReportInaccessibleReads(_inaccessible);
+            active.ReportNullRootReads(_nullRoots);
             return active.EvaluateWide(inst.Argument(0), result);
         }
         case IrOpcode::BitCastU32F32:
@@ -260,6 +268,12 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::IMul64:
             if (binary()) {
                 result = a * b;
+                return true;
+            }
+            return false;
+        case IrOpcode::SMin32:
+            if (binary()) {
+                result = static_cast<std::uint32_t>(std::min(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)), std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(b))));
                 return true;
             }
             return false;
@@ -448,6 +462,12 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::INotEqual32:
             if (binary()) {
                 result = static_cast<std::uint32_t>(a) != static_cast<std::uint32_t>(b) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::SLessThan32:
+            if (binary()) {
+                result = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)) < std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(b)) ? 1u : 0u;
                 return true;
             }
             return false;

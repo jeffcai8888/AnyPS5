@@ -8,12 +8,17 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <atomic>
 #include <stdexcept>
 #include "prx/libc/include/Shutdown.hpp"
 
 #include "prx/libc/include/General.hpp"
 #include "SceTypes.hpp"
+
+extern "C" int APS5_VABI __cxa_atexit_nid_postfix(void (APS5_VABI *func)(void*), void* arg, void* dsoHandle);
 
 namespace {
 
@@ -28,17 +33,9 @@ std::stop_source shutdownSource;
 std::atomic<bool> exitRequested{false};
 std::atomic<bool> exitStarted{false};
 using GuestExitCallback = void (APS5_VABI*)();
-std::mutex exitCallbackMutex;
-std::vector<GuestExitCallback> exitCallbacks;
 
-void runGuestExitCallback() {
-    GuestExitCallback callback;
-    {
-        std::lock_guard lock(exitCallbackMutex);
-        callback = exitCallbacks.back();
-        exitCallbacks.pop_back();
-    }
-    callback();
+void APS5_VABI RunGuestExitCallback(void* callback) {
+    reinterpret_cast<GuestExitCallback>(callback)();
 }
 
 }
@@ -106,6 +103,13 @@ extern "C" {
         std::fprintf(stderr, "[libc] _Exit(%d) called from %p\n", code, __builtin_return_address(0));
         std::fflush(stderr);
     }
+    LibcTerminate_nid_no_patch(code);
+}
+
+[[noreturn]] void LibcTerminate_nid_no_patch(int code) {
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
     std::_Exit(code);
 }
 
@@ -113,6 +117,7 @@ extern "C" {
     exitRequested.store(true);
     if (exitStarted.exchange(true)) LibcAwaitExit_nid_postfix();
     LibcRunShutdown_nid_postfix();
+    CxaFinalize_nid_no_patch(nullptr);
     std::exit(code);
 }
 
@@ -155,11 +160,7 @@ int* APS5_VABI __error_nid_postfix() {
 int APS5_VABI atexit_nid_postfix(GuestExitCallback func) {
     if (func == nullptr)
         return 0;
-    std::lock_guard lock(exitCallbackMutex);
-    exitCallbacks.push_back(func);
-    const int result = std::atexit(runGuestExitCallback);
-    if (result != 0) exitCallbacks.pop_back();
-    return result;
+    return __cxa_atexit_nid_postfix(RunGuestExitCallback, reinterpret_cast<void*>(func), nullptr);
 }
 
 namespace {
@@ -183,6 +184,13 @@ int APS5_VABI at_quick_exit_nid_postfix(GuestExitCallback func) {
     }
     for (auto it = callbacks.rbegin(); it != callbacks.rend(); ++it) (*it)();
     _Exit_nid_postfix(status);
+}
+
+int APS5_VABI daemon_nid_postfix(int noChdir, int noClose) {
+    (void)noChdir;
+    (void)noClose;
+    NotImplemented_nid_no_patch("daemon: forking into the background");
+    return -1;
 }
 
 }

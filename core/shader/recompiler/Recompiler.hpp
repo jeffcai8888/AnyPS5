@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <string_view>
 #include <vector>
 
@@ -107,6 +108,18 @@ enum class ConservativeZExport : std::uint8_t {
     GreaterThanZ
 };
 
+enum class ColorExportPacking : std::uint8_t {
+    None,
+    Unorm10_11_11
+};
+
+enum class RasterPrimitive : std::uint8_t {
+    Point,
+    Line,
+    Triangle,
+    Rectangle
+};
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -132,6 +145,11 @@ struct ShaderPixelStageInfo {
     bool orderedPixelShader;
     std::array<std::uint8_t, 8> targetOutputMode;
     std::array<std::uint8_t, 8> targetExportMapping;
+    std::array<ColorExportPacking, 8> targetExportPacking;
+    bool dualSourceBlend;
+    bool alphaToCoverage;
+    bool stencilRefExportEnable;
+    RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
 };
 
 struct ShaderVertexBufferResource {
@@ -153,6 +171,7 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchAttribReg;
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
+    std::uint32_t paClVsOutCntl = 0;
 };
 
 struct ShaderFloatMode {
@@ -167,6 +186,7 @@ struct ShaderFloatMode {
 inline constexpr std::uint32_t InterpolationQuiet = 1u;
 inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
+inline constexpr std::uint32_t InterpolationRound16Shift = 3u;
 
 struct GuestContext {
     std::uint32_t waveSize;
@@ -217,6 +237,11 @@ struct SpirvTarget {
     bool nonConstantImageOffsets = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool narrowSubgroupClock = false;
+    bool fixedPushSlots = false;
+    bool float64DenormPreserve = false;
+    bool registrationModules = false;
+    std::uint32_t registrationWordLimit = 200000u;
+    bool vertexSubgroups = true;
 };
 
 struct BindingLayout {
@@ -265,11 +290,17 @@ struct TessellationConfiguration {
 
 inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
 inline constexpr std::uint32_t MeshDrawPushBytes = 24;
+inline constexpr std::uint32_t TessellationLevelPushOffsetBytes = 120;
+inline constexpr std::uint32_t TessellationLevelPushBytes = 8;
 inline constexpr std::uint32_t MeshArgumentAddressDword = 4;
 inline constexpr std::uint32_t MeshArgumentIndexCountDword = 3;
 inline constexpr std::uint32_t MeshArgumentFirstIndexDword = 4;
 inline constexpr std::uint32_t MeshArgumentBytes = 20;
+inline constexpr std::uint32_t MeshIndexRestartTable = 0x100;
+inline constexpr std::uint32_t MeshRestartLengthDword = MeshArgumentBytes / 4;
+inline constexpr std::uint32_t MeshRestartTableDword = MeshRestartLengthDword + 1;
 inline constexpr std::uint32_t MeshIndexBufferUserWord = 4;
+inline constexpr std::uint32_t WorkgroupMemoryDescriptorSet = 1;
 
 struct GraphicsDrawParameters {
     std::uint64_t indexAddress;
@@ -351,8 +382,11 @@ struct DescriptorBinding {
     // (a producer that does not fill it) must be treated as written.
     std::vector<bool> bufferWritten;
     std::vector<bool> samplerUnnormalized;
+    std::vector<bool> samplerIntegerBorder;
     std::vector<bool> imageUnnormalized;
+    std::vector<bool> imageUnnormalizedBaseLevel;
     std::vector<std::uint32_t> imageSamplers;
+    std::vector<bool> bufferRead;
 };
 
 struct VertexAttribute {
@@ -369,7 +403,23 @@ struct FragmentParameter {
     bool flat;
     bool perVertex;
     bool custom = false;
+    bool flatP10 = false;
 };
+
+struct BarycentricEmulation {
+    bool active = false;
+    bool smooth = false;
+    bool linear = false;
+};
+
+struct BarycentricEmulationLayout {
+    static constexpr std::uint32_t NoLocation = 0xffffffffu;
+    std::uint32_t smoothLocation = NoLocation;
+    std::uint32_t linearLocation = NoLocation;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> perVertexLocations;
+};
+
+[[nodiscard]] BarycentricEmulationLayout LayoutBarycentricEmulation(std::span<const FragmentParameter> parameters, const BarycentricEmulation& emulation);
 
 // Compiled SPIR-V shared between a cached variant and every result materialized from it: results
 // are copied per dispatch and draw, so the words are reference counted and only duplicated when a
@@ -441,6 +491,7 @@ struct CompiledShaderArtifact {
     std::uint32_t imageMetadataDword = 0;
     std::uint32_t runtimeImageCount = 0;
     std::vector<std::uint32_t> runtimeImageResources;
+    bool registrationModule = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t runtimeAbiVersion = RuntimeAbi::Version;
     std::vector<VertexInput> vertexInputs;
@@ -453,6 +504,7 @@ struct CompiledShaderArtifact {
     std::uint32_t hostSubgroupSize = 0;
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
+    BarycentricEmulation barycentricEmulation;
     std::uint64_t variantId = 0;
 };
 
@@ -467,6 +519,7 @@ struct ShaderInvocation {
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     bool cacheHit = false;
+    std::uint32_t workgroupMemoryDwords = 0;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
 };
 
@@ -489,6 +542,16 @@ struct RectListShaders {
 };
 
 [[nodiscard]] RectListShaders BuildRectListShaders(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target);
+
+struct GeometryStageLimits {
+    std::uint32_t maxGeometryInputComponents;
+    std::uint32_t maxGeometryOutputComponents;
+    std::uint32_t maxGeometryOutputVertices;
+    std::uint32_t maxGeometryTotalOutputComponents;
+    std::uint32_t maxFragmentInputComponents;
+};
+
+[[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
 }
 

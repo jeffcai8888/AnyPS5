@@ -28,15 +28,13 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
     const auto prepare = [&](std::uint64_t address, std::uint8_t type, Stage stage, std::uint32_t rsrc2, std::uint32_t userDataBase) {
         const bool nullPixel = stage == Stage::Fragment && (address == 0 || pixelSkipped);
         if (nullPixel) address = NullPixelProgramAddress();
-        auto it = registry.upper_bound(address);
-        require(it != registry.begin(), "graphics program does not belong to a registered shader");
-        --it;
-        const auto& snapshot = *it->second;
-        require(address - snapshot.codeAddress < snapshot.code.size() * sizeof(std::uint32_t), "graphics program is outside registered shader code");
+        const auto program = ProgramSnapshot(registry, address, {type});
+        const auto& snapshot = *program;
         require((address - snapshot.codeAddress) % sizeof(std::uint32_t) == 0, "graphics entry point is not dword aligned");
-        require(snapshot.type == type, "graphics program refers to an incompatible shader binary type");
-        Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, rsrc2);
-        const auto resources = nullPixel && !queue.shader.contains(rsrc2) ? 0u : ReadGraphicsRegister(queue.shader, rsrc2);
+        require(snapshot.header.empty() || snapshot.type == type, "graphics program refers to an incompatible shader binary type");
+        if (!nullPixel && snapshot.header.empty()) NoteRawGraphicsDraw();
+        if (!nullPixel) Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, rsrc2);
+        const auto resources = nullPixel ? 0u : ReadGraphicsRegister(queue.shader, rsrc2);
         const auto userCount = ((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u);
         require(userCount <= 32, "graphics user SGPR count exceeds the register bank");
         const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
@@ -46,7 +44,7 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
             8,
             {},
             {{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}},
-            it->second,
+            program,
             codeOffset
         };
         for (std::uint32_t i = 0; i < userCount; ++i) {
@@ -83,16 +81,14 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         };
         const auto& graphics = product->state;
         if (graphics.stages.path == Graphics::ShaderPath::Tessellation) {
-            append(0x148, 5, Stage::Local, 0x10b, 0x10c, Role::Local);
+            if (!staticAbi || programAddress(0x148) != 0) append(0x148, 5, Stage::Local, 0x10b, 0x10c, Role::Local);
             append(0x108, 7, Stage::TessellationControl, 0x10b, 0x10c, Role::Hull);
             initializeMerged(programs.back(), 0x102, true);
             append(0x0c8, 2, Stage::TessellationEvaluation, 0x08b, 0x08c, Role::Domain);
         } else if (graphics.stages.path == Graphics::ShaderPath::Geometry) {
             const auto frontAddress = programAddress(0xc8);
-            auto snapshot = registry.upper_bound(frontAddress);
-            require(snapshot != registry.begin(), "geometry front program is not registered");
-            --snapshot;
-            const auto type = snapshot->second->type;
+            const auto front = ProgramSnapshot(registry, frontAddress, {2, 4});
+            const auto type = front->header.empty() ? std::uint8_t{2} : front->type;
             require(type == 2 || type == 4, "invalid geometry front binary type");
             append(0xc8, type, Stage::Mesh, 0x8b, 0x8c, Role::Main);
             initializeMerged(programs.back(), 0x82, type == 4);
@@ -113,9 +109,13 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
 
 std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
     auto product = std::make_shared<DrawDecode>();
-    product->state = Graphics::DecodeState(queue);
+    product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, *submission.shaders));
     DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);
     product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue));
+    product->pixel.targetExportPacking = Graphics::ExportPackings(product->state);
+    product->pixel.dualSourceBlend = product->state.dualSourceBlend;
+    product->pixel.alphaToCoverage = product->state.alphaToCoverage;
+    if (product->pixel.ancillary) product->pixel.rasterPrimitive = Graphics::RasterPrimitiveOf(product->state);
     return product;
 }
 

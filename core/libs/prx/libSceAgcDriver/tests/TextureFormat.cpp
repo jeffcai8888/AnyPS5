@@ -4,9 +4,13 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -55,6 +59,28 @@ void reject(TAction action, std::string_view reason) {
     throw std::runtime_error(std::string("expected texture format rejection: ") + std::string(reason));
 }
 
+int channelLowBit(VkFormat format, VkComponentSwizzle channel) {
+    const auto index = static_cast<std::size_t>(channel - VK_COMPONENT_SWIZZLE_R);
+    switch (format) {
+        case VK_FORMAT_R5G6B5_UNORM_PACK16: return std::array{11, 5, 0, -1}[index];
+        case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return std::array{10, 5, 0, 15}[index];
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16: return std::array{4, 8, 12, 0}[index];
+        default: throw std::runtime_error("no channel layout for packed format " + std::to_string(format));
+    }
+}
+
+void packedChannelTests() {
+    constexpr std::array<std::pair<std::uint32_t, std::array<int, 4>>, 3> packed{{{133u, {0, 5, 11, 0}}, {134u, {0, 5, 10, 15}}, {136u, {0, 4, 8, 12}}}};
+    constexpr std::array components{VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
+    for (const auto& [format, lowBits] : packed) {
+        for (std::size_t component = 0; component < components.size(); ++component) {
+            const auto channel = TextureComponentChannel(format, components[component]);
+            Require(channelLowBit(ResolveTextureFormat(format), channel) == lowBits[component], "format " + std::to_string(format) + " component " + std::to_string(component) + " is not read from bit " + std::to_string(lowBits[component]));
+        }
+    }
+    Require(TextureComponentChannel(133, VK_COMPONENT_SWIZZLE_ONE) == VK_COMPONENT_SWIZZLE_ONE && TextureComponentChannel(56, VK_COMPONENT_SWIZZLE_R) == VK_COMPONENT_SWIZZLE_R, "constant selectors and other formats must keep their channels");
+}
+
 void convertedDccClearTests() {
     alignas(64) std::array<std::uint8_t, 16> keys{};
     GuestTextureResource resource{};
@@ -72,11 +98,57 @@ void convertedDccClearTests() {
     Require(read(20, 0x40) == DccKeys::Clear0001 && read(20, 0x80) == DccKeys::Clear1110, "format 20 must keep its 0001 and 1110 DCC clear codes");
 }
 
+void singleDccKeysTests() {
+    alignas(256) std::array<std::uint32_t, 256> texels{};
+    for (std::size_t index = 0; index < texels.size(); ++index) texels[index] = 0x01000000u + static_cast<std::uint32_t>(index);
+    alignas(64) std::array<std::uint8_t, sizeof(texels) / 256> keys{};
+    keys.fill(0x10);
+    GuestTextureResource resource{};
+    resource.baseAddress = reinterpret_cast<std::uint64_t>(texels.data());
+    resource.dccAddress = reinterpret_cast<std::uint64_t>(keys.data());
+    const auto read = [&](std::uint32_t format) {
+        resource.format = format;
+        return TextureClearKeys(resource, sizeof(texels));
+    };
+    const auto* original = reinterpret_cast<const std::byte*>(texels.data());
+    for (const std::uint32_t format : {1u, 56u, 77u}) {
+        Require(read(format) == DccKeys::ClearSingle, "comp-to-single keys of format " + std::to_string(format) + " must read as single");
+        const auto elementBytes = BytesPerElement(format);
+        std::vector<std::byte> surface(sizeof(texels));
+        ReadTextureSurface(resource, DccKeys::ClearSingle, surface);
+        bool expanded = true;
+        for (std::size_t offset = 0; offset < surface.size(); ++offset) expanded = expanded && surface[offset] == original[offset / 256 * 256 + offset % elementBytes];
+        Require(expanded, "a read of format " + std::to_string(format) + " under comp-to-single keys must give every 256-byte block its first element");
+    }
+    Require(read(74) == DccKeys::Uncompressed, "comp-to-single keys of a format whose element does not divide 256 bytes must read as stored");
+    keys[1] = 0xff;
+    Require(read(56) == DccKeys::Uncompressed, "comp-to-single keys mixed with uncompressed ones must read as stored");
+}
+
+void packedFloatDccClearTests() {
+    for (const bool alphaOnMsb : {false, true}) {
+        for (const auto keys : {DccKeys::Clear0000, DccKeys::Clear0001, DccKeys::Clear1110, DccKeys::Clear1111}) {
+            std::array<std::uint32_t, 4> texels{};
+            texels.fill(0xdeadbeefu);
+            Require(FillDccClear(VK_FORMAT_B10G11R11_UFLOAT_PACK32, keys, alphaOnMsb, std::as_writable_bytes(std::span(texels))), "packed float fast clear was not encoded");
+            const std::uint32_t expected = keys == DccKeys::Clear1110 || keys == DccKeys::Clear1111 ? 0x781e03c0u : 0u;
+            for (const auto texel : texels) Require(texel == expected, "packed float DCC clear did not encode RGB zero or one");
+        }
+    }
+    alignas(64) std::array<std::uint8_t, 4> keys{0xc0, 0xc0, 0xc0, 0xc0};
+    GuestTextureResource resource{};
+    resource.format = 36;
+    resource.dccAddress = reinterpret_cast<std::uint64_t>(keys.data());
+    Require(TextureClearKeys(resource, 1024) == DccKeys::Clear1111, "packed float texture discarded its white fast-clear keys");
+}
+
 }
 
 void RunTextureFormatTests() {
     srgbDecodeTests();
+    packedChannelTests();
     Require(ResolveTextureFormat(1) == VK_FORMAT_R8_UNORM, "format 1 must resolve to R8_UNORM");
+    Require(ResolveTextureFormat(2) == VK_FORMAT_R8_SNORM, "format 2 must resolve to R8_SNORM");
     Require(BytesPerElement(1) == 1u, "format 1 must be one byte wide");
     Require(!IsBlockCompressed(1), "format 1 must not be block compressed");
     Require(BlockWidth(1) == 1u && BlockHeight(1) == 1u, "format 1 must have a one-texel block");
@@ -114,9 +186,11 @@ void RunTextureFormatTests() {
     reject([] { ResolveTextureFormat(0); }, "unsupported guest texture format");
     reject([] { ResolveTextureFormat(183); }, "unsupported guest texture format");
     reject([] { ResolveTextureFormat(9999); }, "unsupported guest texture format");
-    reject([] { BytesPerElement(2); }, "unsupported guest texture format");
+    reject([] { BytesPerElement(3); }, "unsupported guest texture format");
     reject([] { IsBlockCompressed(200); }, "unsupported guest texture format");
     for (const std::uint32_t format : {128u, 129u, 130u, 170u, 172u, 174u, 182u}) Require(IsSrgbTextureFormat(format), "guest format " + std::to_string(format) + " must be an sRGB texture format");
     for (const std::uint32_t format : {1u, 14u, 56u, 71u, 169u, 171u, 173u, 181u}) Require(!IsSrgbTextureFormat(format), "guest format " + std::to_string(format) + " must not be an sRGB texture format");
     convertedDccClearTests();
+    singleDccKeysTests();
+    packedFloatDccClearTests();
 }

@@ -12,12 +12,15 @@ if(BUILD_TESTING)
     add_test(NAME guest_quick_exit COMMAND guest_system_exit_tests --quick-exit)
     add_test(NAME guest_immediate_exit COMMAND guest_system_exit_tests --immediate)
     add_test(NAME guest_return_from_main COMMAND guest_system_exit_tests --return-from-main)
+    add_test(NAME guest_system_relaunch COMMAND guest_system_exit_tests --relaunch-driver)
     set_tests_properties(guest_system_exit PROPERTIES
         PASS_REGULAR_EXPRESSION "Guest shutdown and atexit completed")
     set_tests_properties(guest_quick_exit PROPERTIES
         PASS_REGULAR_EXPRESSION "Guest quick_exit handlers completed")
+    set_tests_properties(guest_system_relaunch PROPERTIES
+        PASS_REGULAR_EXPRESSION "Guest relaunch completed" TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(guest_system_exit guest_system_exit_parameters guest_immediate_exit guest_return_from_main guest_quick_exit PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_system_exit guest_system_exit_parameters guest_immediate_exit guest_return_from_main guest_quick_exit guest_system_relaunch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_system_service_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemService.cpp)
@@ -27,6 +30,15 @@ if(BUILD_TESTING)
     add_test(NAME guest_system_service COMMAND guest_system_service_tests)
     if(WIN32)
         set_tests_properties(guest_system_service PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_system_service_language_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemServiceLanguage.cpp)
+    target_include_directories(guest_system_service_language_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_system_service_language_tests PRIVATE libSceSystemService libc)
+    configure_windows_unwind(guest_system_service_language_tests)
+    add_test(NAME guest_system_service_language COMMAND guest_system_service_language_tests)
+    if(WIN32)
+        set_tests_properties(guest_system_service_language PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_system_kill_app_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemKillApp.cpp)

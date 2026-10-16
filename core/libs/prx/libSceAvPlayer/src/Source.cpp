@@ -3,6 +3,7 @@
 
 #include "prx/libSceAvPlayer/include/AvPlayer.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/FilesystemError.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -243,7 +244,9 @@ public:
             format->pb = replacement->Context();
             format->flags |= AVFMT_FLAG_CUSTOM_IO;
         } else {
-            const auto resolved = ResolvePath_nid_no_patch(path.c_str()).u8string();
+            std::filesystem::path hostPath;
+            if (ResolvePathError_nid_no_patch(path.c_str(), hostPath) != 0) return false;
+            const auto resolved = hostPath.u8string();
             url = "file:" + std::string(resolved.begin(), resolved.end());
         }
         if (const int error = avformat_open_input(&format, replacement ? nullptr : url.c_str(), nullptr, nullptr); error < 0) {
@@ -509,9 +512,9 @@ private:
             presentationClock.Rebase(static_cast<double>(front.info.timestamp));
             clockEpoch = front.epoch;
         }
-        if (synced) {
+        if (synced || audioDriving) {
             const auto now = presentationClock.Now();
-            if (static_cast<double>(front.info.timestamp) > now) return false;
+            if (synced && static_cast<double>(front.info.timestamp) > now) return false;
             while (frames.size() > 1 && frames[1].epoch == frames.front().epoch && static_cast<double>(frames[1].info.timestamp) <= now) recycleFront(video);
         }
         present(video, info);

@@ -3,14 +3,18 @@
 
 #include <set>
 #include <string>
+#include <vector>
 #include <cstdint>
 
 namespace Cli {
 
 struct Args {
+    bool showHelp = false;
     bool skipSyscallCheck = false;
+    bool trapSdkSyscallStubs = false;
     bool skipSceModule = false;
     bool toIntel = false;
+    bool toRosetta = false;
     bool writeRegistry = false;
     bool toWindows = false;
     bool toMacos = false;
@@ -21,11 +25,16 @@ struct Args {
     std::uint32_t unusedFilterLevel = 0;
     std::string inputPath;
     std::string outputPath;
+    std::string sceModulePath;
     std::string runPath = "$ORIGIN/libs";
     std::set<std::string> excludedSceModules;
+    std::vector<std::string> moduleDirectories;
+    std::vector<std::string> executables;
 };
 
 Args ParseArgs(int argc, char* argv[]);
+
+const char* Usage();
 
 int Autorun(const std::string& absPath, bool toWindows);
 

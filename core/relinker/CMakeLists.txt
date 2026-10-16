@@ -1,7 +1,6 @@
-add_executable(relinker
-        ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp
+option(ANYPS5_RELINKER_CLI "Build the native relinker command line" ON)
+
+add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxElfPatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxGuestModuleWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsGuestModuleWriter.cpp
@@ -31,8 +30,7 @@ add_executable(relinker
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteReader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/BufferUtils.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileReader.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/NativePath.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/Amd64OnlyConverter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/InstructionScanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionDecoder.cpp
@@ -50,6 +48,8 @@ add_executable(relinker
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ClzeroLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ReciprocalOperands.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ReciprocalLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/WideStoreOperands.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/WideStoreLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/parsing/ElfReader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/SyscallScanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/CallSiteResolver.cpp
@@ -66,16 +66,54 @@ add_executable(relinker
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/ValidationPolicy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/output/SysVDynamicSectionBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/output/CallRegistryWriter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/Conversion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/RelinkerPipeline.cpp
 )
-target_include_directories(relinker PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/include
+target_include_directories(relinker_core PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
         ${CMAKE_CURRENT_SOURCE_DIR}/io/include
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
 )
+
+target_compile_features(relinker_core PUBLIC cxx_std_20)
+set_target_properties(relinker_core PROPERTIES CXX_EXTENSIONS OFF)
+
+if(BUILD_TESTING)
+    add_test_executable(relinker_conversion_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/ConversionTests.cpp)
+    target_link_libraries(relinker_conversion_tests PRIVATE relinker_core)
+    add_test(NAME relinker_conversion COMMAND relinker_conversion_tests)
+    set_tests_properties(relinker_conversion PROPERTIES TIMEOUT 20)
+endif()
+
+if(NOT ANYPS5_RELINKER_CLI)
+    return()
+endif()
+
+add_executable(relinker
+    ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxDesktopEntryWriter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libkernel/AppMetadata/src/ParamJsonParser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileReader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/NativeModules.cpp)
+target_link_libraries(relinker PRIVATE relinker_core)
+target_include_directories(relinker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
+set_target_properties(relinker PROPERTIES CXX_EXTENSIONS OFF)
+
+if(BUILD_TESTING AND WIN32)
+    add_test_executable(windows_guest_export_alias_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/WindowsExportAliasTests.cpp)
+    target_link_libraries(windows_guest_export_alias_tests PRIVATE relinker_core)
+    add_test(NAME windows_guest_export_aliases COMMAND windows_guest_export_alias_tests)
+endif()
+
+if(WIN32)
+    target_compile_options(relinker PRIVATE -municode)
+    target_link_options(relinker PRIVATE -municode)
+endif()
 
 if(WIN32)
     add_test_executable(windows_dependency_diagnostics_tests EXCLUDE_FROM_ALL
@@ -118,6 +156,8 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ClzeroLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ReciprocalOperands.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ReciprocalLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/WideStoreOperands.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/WideStoreLowering.cpp
     )
     target_include_directories(amd64_only_windows_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include ${CMAKE_CURRENT_SOURCE_DIR}/domain/include ${CMAKE_CURRENT_SOURCE_DIR}/io/include ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libc/src/specifics/windows)
     if(BUILD_TESTING)
@@ -128,17 +168,93 @@ endif()
 
 
 if(BUILD_TESTING)
+    add_test_executable(elf_reader_bounds_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/ElfReaderBoundsTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/parsing/ElfReader.cpp)
+    target_include_directories(elf_reader_bounds_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include)
+    add_test(NAME elf_reader_bounds COMMAND elf_reader_bounds_tests)
+    set_tests_properties(elf_reader_bounds PROPERTIES TIMEOUT 20)
+
+    add_test_executable(call_site_index_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/CallSiteIndexTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/CallSiteResolver.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/InstructionScanner.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionDecoder.cpp
+    )
+    target_include_directories(call_site_index_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/include
+    )
+    add_test(NAME call_site_index COMMAND call_site_index_tests)
+    set_tests_properties(call_site_index PROPERTIES TIMEOUT 20)
+
+    add_test_executable(sdk_mman_syscall_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/SdkMmanSyscallTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/SyscallScanner.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/InstructionScanner.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionDecoder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/DecodedInstruction.cpp)
+    target_include_directories(sdk_mman_syscall_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include)
+    add_test(NAME sdk_mman_syscall COMMAND sdk_mman_syscall_tests)
+    set_tests_properties(sdk_mman_syscall PROPERTIES TIMEOUT 20)
+
     add_test_executable(autorun_exit_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/cli/tests/AutorunExitTests.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp)
-    target_include_directories(autorun_exit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/NativePath.cpp)
+    target_include_directories(autorun_exit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include ${CMAKE_CURRENT_SOURCE_DIR}/io/include ${CMAKE_CURRENT_SOURCE_DIR}/domain/include)
     add_test(NAME autorun_exit_status COMMAND autorun_exit_tests)
     set_tests_properties(autorun_exit_status PROPERTIES TIMEOUT 20)
+    add_test_executable(rewrite_boundaries_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/tests/RewriteBoundaryTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionRewriter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/InstructionScanner.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionDecoder.cpp
+    )
+    target_include_directories(rewrite_boundaries_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/include
+    )
+    add_test(NAME rewrite_boundaries COMMAND rewrite_boundaries_tests)
+    set_tests_properties(rewrite_boundaries PROPERTIES TIMEOUT 20)
+
     add_test_executable(cli_args_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/cli/tests/CliArgsTests.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp)
-    target_include_directories(cli_args_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/NativePath.cpp)
+    target_include_directories(cli_args_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/cli/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+    )
     add_test(NAME cli_args COMMAND cli_args_tests)
+    add_test_executable(program_layout_ranges_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/ProgramLayoutRangeTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/ProgramHeaderLayoutBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteWriter.cpp
+    )
+    target_include_directories(program_layout_ranges_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/include
+    )
+    add_test(NAME program_layout_ranges COMMAND program_layout_ranges_tests)
+    set_tests_properties(program_layout_ranges PROPERTIES TIMEOUT 20)
+
     add_test_executable(buffer_bounds_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/io/tests/BufferBoundsTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteReader.cpp
@@ -148,10 +264,18 @@ if(BUILD_TESTING)
     target_include_directories(buffer_bounds_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/io/include)
     add_test(NAME buffer_bounds COMMAND buffer_bounds_tests)
 
+    add_test_executable(param_json_utf8_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../libs/tests/ParamJsonParser.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libkernel/AppMetadata/src/ParamJsonParser.cpp)
+    target_include_directories(param_json_utf8_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
+    add_test(NAME param_json_utf8 COMMAND param_json_utf8_tests)
+    set_tests_properties(param_json_utf8 PROPERTIES TIMEOUT 20)
+
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test_executable(file_writer_tests
             ${CMAKE_CURRENT_SOURCE_DIR}/io/tests/FileWriterTests.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/io/src/NativePath.cpp
         )
         target_include_directories(file_writer_tests PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
@@ -159,7 +283,37 @@ if(BUILD_TESTING)
         )
         add_test(NAME file_writer_binary COMMAND file_writer_tests binary)
         add_test(NAME file_writer_text COMMAND file_writer_tests text)
+
+        add_test_executable(linux_desktop_entry_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/LinuxDesktopEntryTests.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxDesktopEntryWriter.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libkernel/AppMetadata/src/ParamJsonParser.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/io/src/NativePath.cpp
+        )
+        target_include_directories(linux_desktop_entry_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/io/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../libs
+        )
+        add_test(NAME linux_desktop_entry COMMAND linux_desktop_entry_tests)
     endif()
+
+    add_test_executable(section_header_ranges_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/SectionRangeTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/SectionHeaderTableBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteWriter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/BufferUtils.cpp
+    )
+    target_include_directories(section_header_ranges_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/include
+    )
+    add_test(NAME section_header_ranges COMMAND section_header_ranges_tests)
+    set_tests_properties(section_header_ranges PROPERTIES TIMEOUT 20)
 
     add_test_executable(amd64_only_converter_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/tests/Amd64OnlyConverterTests.cpp
@@ -180,6 +334,8 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ClzeroLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ReciprocalOperands.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ReciprocalLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/WideStoreOperands.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/WideStoreLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxElfPatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/SegmentFilter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/EntryStubBuilder.cpp
@@ -195,21 +351,59 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/io/include
     )
     add_test(NAME amd64_only_converter COMMAND amd64_only_converter_tests)
+    add_test_executable(call_site_resolver_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/CallSiteResolverTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/CallSiteResolver.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/InstructionScanner.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionDecoder.cpp
+    )
+    target_include_directories(call_site_resolver_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
+    )
+    add_test(NAME call_site_resolver COMMAND call_site_resolver_tests)
+    add_test_executable(decoder_length_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/tests/DecoderLengthTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionDecoder.cpp
+    )
+    target_include_directories(decoder_length_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
+    )
+    add_test(NAME decoder_length COMMAND decoder_length_tests)
 
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME cli_help COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/cli/tests/test_help.py $<TARGET_FILE:relinker>)
         add_test(NAME elf_offsets COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_elf_offsets.py $<TARGET_FILE:relinker>)
         add_test(NAME dynamic_segment COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_dynamic_segment.py $<TARGET_FILE:relinker>)
         add_test(NAME rela_size COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_rela_size.py $<TARGET_FILE:relinker>)
+        add_test(NAME none_relocations COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_none_relocations.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_none_relocations COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_none_relocations.py $<TARGET_FILE:relinker>)
+        set_tests_properties(guest_none_relocations PROPERTIES TIMEOUT 20)
         add_test(NAME optional_plt COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_optional_plt.py $<TARGET_FILE:relinker>)
         add_test(NAME empty_tls COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_empty_tls.py $<TARGET_FILE:relinker>)
-        add_test(NAME tls_function_coverage COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_tls_function_coverage.py $<TARGET_FILE:relinker>)
+        set(tlsCoverageGroups metadata padding register_loads displacement_bounds alu_execution register_address_loads moved_branch rejected)
+        foreach(register IN ITEMS 0 1 2 3 5 6 7 8 9 10 11 12 13 14 15)
+            list(APPEND tlsCoverageGroups displacement_r${register})
+        endforeach()
+        foreach(opcode IN ITEMS add or adc sbb and sub xor cmp)
+            list(APPEND tlsCoverageGroups alu_${opcode})
+        endforeach()
+        foreach(group IN LISTS tlsCoverageGroups)
+            add_test(NAME tls_function_coverage_${group} COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_tls_function_coverage.py $<TARGET_FILE:relinker> ${group})
+            set_tests_properties(tls_function_coverage_${group} PROPERTIES TIMEOUT 30 LABELS tls_function_coverage)
+        endforeach()
         add_test(NAME tls_diagnostics COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_tls_diagnostics.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_load_alignment COMMAND ${Python3_EXECUTABLE}
@@ -218,26 +412,51 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_eh_frame_header.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_dynamic_strings COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_dynamic_strings.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_runpath COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_runpath.py $<TARGET_FILE:relinker>)
         add_test(NAME executable_segments COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_executable_segments.py $<TARGET_FILE:relinker>)
+        add_test(NAME linux_executable_exports COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_executable_exports.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_entry_argv COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_entry_argv.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_program_header_order COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_program_header_order.py $<TARGET_FILE:relinker>)
+        add_test(NAME linux_input_program_headers COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_input_program_headers.py $<TARGET_FILE:relinker>)
         add_test(NAME windows_gui COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_gui.py $<TARGET_FILE:relinker>)
+        add_test(NAME windows_working_directory COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_working_directory.py $<TARGET_FILE:relinker>)
+        add_test(NAME windows_runpath COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_runpath.py $<TARGET_FILE:relinker>)
+        set_tests_properties(windows_runpath PROPERTIES TIMEOUT 30)
         add_test(NAME windows_address_space COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_address_space.py $<TARGET_FILE:relinker>)
+        add_test(NAME windows_tls_thread_pointer COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_tls_thread_pointer.py $<TARGET_FILE:relinker>)
+        add_test(NAME windows_bss COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_bss.py $<TARGET_FILE:relinker>)
         add_test(NAME windows_icon COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_icon.py $<TARGET_FILE:relinker>)
+        add_test(NAME linux_desktop_entry_output COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_desktop_entry_output.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_intel_trampolines COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_intel_trampolines.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_syscall_trap COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_syscall_trap.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_tls COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_tls.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_needed_modules COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_needed_modules.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_module_dir COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_dir.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_module_directories COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_directories.py $<TARGET_FILE:relinker>)
+        add_test(NAME relinker_executables COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_executables.py $<TARGET_FILE:relinker>)
+        add_test(NAME sce_module_path COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_module_path.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_guest_stack COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_guest_stack.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_symbol_names COMMAND ${Python3_EXECUTABLE}
@@ -259,21 +478,75 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_absolute_symbols.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_module_identity COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_identity.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_export_lookup COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_export_lookup.py $<TARGET_FILE:relinker>)
+        set_tests_properties(guest_export_lookup PROPERTIES TIMEOUT 30)
+        add_test(NAME guest_needed_nested_modules COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_needed_nested_modules.py $<TARGET_FILE:relinker>)
         add_test(NAME windows_import_modules COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_import_modules.py $<TARGET_FILE:relinker>)
         add_test(NAME elf_header COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_elf_header.py $<TARGET_FILE:relinker>)
+        add_test(NAME weak_imports COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_weak_imports.py $<TARGET_FILE:relinker>)
         add_test(NAME input_magic COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_input_magic.py $<TARGET_FILE:relinker>)
+        add_test(NAME input_preservation COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_input_preservation.py $<TARGET_FILE:relinker>)
+        add_test(NAME input_file COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_input_file.py $<TARGET_FILE:relinker>)
+        add_test(NAME null_symbol_relocations COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_null_symbol_relocations.py $<TARGET_FILE:relinker>)
+        add_test(NAME input_nonascii COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_input_nonascii.py $<TARGET_FILE:relinker>)
         add_test(NAME string_table_bounds COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_string_table_bounds.py $<TARGET_FILE:relinker>)
+        add_test(NAME sce_code_extent COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_code_extent.py $<TARGET_FILE:relinker>)
+        add_test(NAME sce_relro COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_relro.py $<TARGET_FILE:relinker>)
         add_test(NAME call_registry COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_call_registry.py $<TARGET_FILE:relinker>)
         add_test(NAME jmprel_table_bounds COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_jmprel_table_bounds.py $<TARGET_FILE:relinker>)
+        if(WIN32)
+            add_test(NAME windows_diagnostic_fixture_isolation COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/test_windows_diagnostic_fixture_isolation.py $<TARGET_FILE:windows_dependency_diagnostics_tests>)
+            set_tests_properties(windows_diagnostic_fixture_isolation PROPERTIES TIMEOUT 30)
+        endif()
+        add_test(NAME entry_point_bounds COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_entry_point_bounds.py $<TARGET_FILE:relinker>)
+        add_test(NAME init_array_roots COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_init_array_roots.py $<TARGET_FILE:relinker>)
+        add_test(NAME gnu_hash_analysis COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_gnu_hash_analysis.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_gnu_hash COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_gnu_hash.py $<TARGET_FILE:relinker>)
+        set_tests_properties(guest_gnu_hash PROPERTIES TIMEOUT 20)
+        add_test(NAME to_rosetta COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_to_rosetta.py $<TARGET_FILE:relinker>)
+        add_test(NAME syscall_number COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_syscall_number.py $<TARGET_FILE:relinker>)
+        add_test(NAME unused_filter_indirect COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_unused_filter_indirect.py $<TARGET_FILE:relinker>)
     else()
         message(STATUS "Python3 interpreter not found; skipping Python relinker tests")
     endif()
+    add_test_executable(unwind_record_bounds_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/UnwindRecordBoundsTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/UnusedNidFilter/EhFrameReader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/BufferUtils.cpp
+    )
+    target_include_directories(unwind_record_bounds_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/include
+    )
+    add_test(NAME unwind_record_bounds COMMAND unwind_record_bounds_tests)
+    set_tests_properties(unwind_record_bounds PROPERTIES TIMEOUT 20)
+
     add_test_executable(windows_icon_resource_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsIconResourceTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsIconResourceBuilder.cpp
@@ -286,6 +559,30 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/io/include
     )
     add_test(NAME windows_icon_resource COMMAND windows_icon_resource_tests)
+
+    add_test_executable(entry_stub_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/EntryStubTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/EntryStubBuilder.cpp
+    )
+    target_include_directories(entry_stub_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+    )
+    add_test(NAME entry_stub COMMAND entry_stub_tests)
+
+    add_test_executable(control_flow_graph_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/ControlFlowGraphTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/UnusedNidFilter/ControlFlowGraph.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/UnusedNidFilter/StrictReachability.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionDecoder.cpp
+    )
+    target_include_directories(control_flow_graph_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+    )
+    add_test(NAME control_flow_graph COMMAND control_flow_graph_tests)
+    set_tests_properties(control_flow_graph PROPERTIES TIMEOUT 20)
 
     add_test_executable(strict_nid_filter_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/StrictNidFilterTests.cpp
@@ -322,6 +619,11 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/RelaBoundsTests.cpp
         )
         add_test(NAME rela_bounds COMMAND rela_bounds_tests $<TARGET_FILE:relinker>)
+
+        add_test_executable(syscall_scanner_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/SyscallScannerTests.cpp
+        )
+        add_test(NAME syscall_scanner COMMAND syscall_scanner_tests $<TARGET_FILE:relinker>)
         add_test_executable(guest_intel_trampolines_tests
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/GuestIntelTrampolinesTests.cpp
         )
