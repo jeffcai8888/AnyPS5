@@ -157,12 +157,8 @@ std::int64_t APS5_VABI CollateHash(const GuestLocale::CollateFacet*, const char*
 
 const GuestLocale::CollateVtable g_collateVtable{{DestroyCollate, DeleteCollate, RetainFacet, ReleaseFacet}, CollateCompare, CollateTransform, CollateHash};
 
-// The guest's wchar_t is 16 bits, so the wide facet needs its own entries: collate<wchar_t> reaches the
-// same slots with ranges of 16-bit characters, whose length is a count of characters and not of bytes.
-// The C locale orders them by value, as Dinkumware's char_traits<wchar_t>::compare does, mixes one
-// whole character per hash round, and copies them into the result, whose size and capacity are bytes.
 constexpr std::size_t GuestWideCharacterSize = 2;
-constexpr std::size_t GuestWideInlineCapacity = sizeof(GuestLocale::String::buffer) - GuestWideCharacterSize;
+constexpr std::size_t GuestWideInlineCapacity = sizeof(GuestLocale::String::buffer) / GuestWideCharacterSize - 1;
 
 void ValidateWideCharacterRange(const std::uint16_t* first, const std::uint16_t* last, const char* function) {
     if ((first == nullptr) != (last == nullptr) || last < first) throw std::invalid_argument(std::string(function) + ": invalid character range");
@@ -195,15 +191,15 @@ GuestLocale::String* APS5_VABI WideCollateTransform(GuestLocale::String* result,
     const auto bytes = length * GuestWideCharacterSize;
     char* data = result->buffer;
     std::size_t capacity = GuestWideInlineCapacity;
-    if (bytes > GuestWideInlineCapacity) {
-        capacity = bytes | GuestStringCapacityMask;
-        data = static_cast<char*>(AllocateStringStorage(capacity + GuestWideCharacterSize));
+    if (length > GuestWideInlineCapacity) {
+        capacity = length | GuestWideInlineCapacity;
+        data = static_cast<char*>(AllocateStringStorage((capacity + 1) * GuestWideCharacterSize));
     }
     if (length != 0) std::memcpy(data, characters, bytes);
     data[bytes] = 0;
     data[bytes + 1] = 0;
     if (data != result->buffer) result->pointer = data;
-    result->size = bytes;
+    result->size = length;
     result->capacity = capacity;
     return result;
 }
@@ -311,6 +307,23 @@ void APS5_VABI _ZNSt8ios_baseD2Ev_nid_postfix(GuestLocale::IosBase* self) {
     self->locale = nullptr;
 }
 
+GuestLocale::IosBase* APS5_VABI SetStreamWidth(GuestLocale::IosBase* stream, std::int32_t width) {
+    if (stream == nullptr) throw std::invalid_argument("setw: null stream");
+    stream->width = width;
+    return stream;
+}
+
+struct StreamManipulator {
+    GuestLocale::IosBase* (APS5_VABI* function)(GuestLocale::IosBase*, std::int32_t);
+    std::int32_t argument;
+};
+
+static_assert(sizeof(StreamManipulator) == 0x10);
+
+StreamManipulator APS5_VABI _ZSt4setwi_nid_postfix(std::int32_t width) {
+    return {&SetStreamWidth, width};
+}
+
 // Dinkumware's static locale::_Init(bool) returns the global _Locimp, which the caller copies.
 GuestLocale::Implementation* APS5_VABI _ZNSt6locale5_InitEv_nid_postfix() {
     std::lock_guard<std::mutex> lock(g_localeInitMutex);
@@ -331,6 +344,17 @@ void APS5_VABI _ZNSt6locale5facet9_RegisterEv_nid_postfix(GuestLocale::Facet* se
 
 GuestLocale::Implementation* APS5_VABI _ZNSt6locale16_GetgloballocaleEv_nid_postfix() {
     return &g_classicLocale;
+}
+
+namespace {
+struct GuestLocaleFacade {
+    GuestLocale::Implementation* implementation;
+};
+GuestLocaleFacade g_classicLocaleFacade{&g_classicLocale};
+}
+
+GuestLocaleFacade* APS5_VABI _ZNSt6locale7classicEv_nid_postfix() {
+    return &g_classicLocaleFacade;
 }
 
 std::size_t APS5_VABI _ZNSt7collateIwE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(GuestLocale::Facet** facet, const GuestLocale::Implementation* const* locale) {
