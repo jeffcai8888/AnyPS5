@@ -7,7 +7,9 @@ set_target_properties(libScePad PROPERTIES CXX_EXTENSIONS OFF)
 # The pad module uses std::filesystem whose template instantiations the MinGW
 # libstdc++-6.dll does not export; static-link the runtime into the module instead.
 if(MINGW)
-    target_link_options(libScePad PRIVATE -static-libstdc++)
+    # libc.prx also exports the C++ ABI helpers, so the duplicate definitions the static
+    # runtime brings in are resolved locally on purpose.
+    target_link_options(libScePad PRIVATE -static-libstdc++ -Wl,--allow-multiple-definition)
 endif()
 configure_windows_unwind(libScePad)
 
