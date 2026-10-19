@@ -4,6 +4,11 @@ add_library(libScePad SHARED EXCLUDE_FROM_ALL
 )
 target_include_directories(libScePad PRIVATE ${LIBS_INCLUDE_DIR})
 set_target_properties(libScePad PROPERTIES CXX_EXTENSIONS OFF)
+# The pad module uses std::filesystem whose template instantiations the MinGW
+# libstdc++-6.dll does not export; static-link the runtime into the module instead.
+if(MINGW)
+    target_link_options(libScePad PRIVATE -static-libstdc++)
+endif()
 configure_windows_unwind(libScePad)
 
 if(BUILD_TESTING)

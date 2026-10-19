@@ -3737,13 +3737,11 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
     if (const auto found = index.find(key); found != index.end()) {
-        trackedBytes -= std::min(trackedBytes, found->second->pinned);
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
     }
     const auto pinned = resources != nullptr ? resources->PinnedBytes() : 0u;
-    trackedBytes += pinned;
     entries.push_front(Entry{key, std::move(resources), pinned});
     index.emplace(key, entries.begin());
     if (capacity == 0) {
@@ -3761,7 +3759,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     }
     static std::atomic<std::uint64_t> inserts{0};
     const auto count = inserts.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (count <= 5 || count % 500 == 0) std::fprintf(stderr, "[rescache] insert %llu: %zu entries, %llu MiB tracked, entry pins %llu MiB\n", static_cast<unsigned long long>(count), entries.size(), trackedBytes >> 20u, (entries.front().second != nullptr ? entries.front().second->PinnedBytes() : 0ull) >> 20u);
+    if (count <= 5 || count % 500 == 0) std::fprintf(stderr, "[rescache] insert %llu: %zu entries\n", static_cast<unsigned long long>(count), entries.size());
     if (entries.front().second->TableElements() == 0) return;
     std::uint64_t tables = 0;
     for (const auto& entry : entries) tables += entry.second->TableElements();
@@ -3881,7 +3879,6 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
-    trackedBytes -= std::min(trackedBytes, found->second->pinned);
     entries.erase(found->second);
     index.erase(found);
 }
