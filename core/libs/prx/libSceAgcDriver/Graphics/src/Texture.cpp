@@ -449,7 +449,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                     for (std::uint32_t level = 0; level < mips.size(); ++level) {
                         if (!geometry.HasLayer(level, layer)) continue;
                         const auto offset = geometry.LinearLayerOffset(layer) + mips[level].linearOffset;
-                        detiler.DispatchRepack(commands, linear->Handle(), offset, linear->Handle(), offset, mips[level].linearSize);
+                        detiler.DispatchRepack(commands, linearHandle, offset, linearHandle, offset, mips[level].linearSize);
                     }
                 }
             }
@@ -492,7 +492,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 }
             }
             context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linearHandle, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
-            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), uploadImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linearHandle, uploadImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
             if (srgbExpand) {
                 std::array<VkImageMemoryBarrier, 2> toBlit{};
                 toBlit[0] = toTransferDst;
