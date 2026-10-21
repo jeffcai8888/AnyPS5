@@ -276,6 +276,9 @@ static void CheckTableCalls() {
     std::vector<std::uint32_t> large(0x8000u, 0xbf800000u);
     const std::vector<std::vector<TableCallee>> far{{{0x10ull, large}, {0x20ull, first}}};
     ExpectThrow("out of s_call_b64 range", [&] { static_cast<void>(LinkCalls(program, {}, {}, calls, far)); });
+    const std::vector<UserDataCall> overlap{{0x24u, 14u, 12u}};
+    const std::vector<std::vector<std::uint32_t>> overlapCallees{first};
+    ExpectThrow("both a user-data call and a table call", [&] { static_cast<void>(LinkCalls(program, overlap, overlapCallees, calls, callees)); });
 
     const std::vector<std::uint32_t> jumpTable{
         0xbe8c1f00u, 0x800cff0cu, 0x00000058u, 0x820d800du, 0x83928202u, 0xd4c40016u, 0x02000500u, 0x8f128212u, 0xf4000386u, 0x24000000u,

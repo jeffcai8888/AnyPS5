@@ -807,7 +807,7 @@ ShaderRecompiler::LinkedCalls LinkUserDataCallees(const ShaderRecompiler::Recomp
     const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
     const ShaderRecompiler::SwappcInfo swappc{false, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize};
     auto calls = ShaderRecompiler::FindUserDataCalls(program, swappc);
-    const auto tableCalls = ShaderRecompiler::FindTableCalls(program, swappc);
+    auto tableCalls = ShaderRecompiler::FindTableCalls(program, swappc);
     if (calls.empty() && tableCalls.empty()) return {};
     std::vector<std::uint64_t> addresses;
     for (const auto& call : calls) {
@@ -846,6 +846,9 @@ ShaderRecompiler::LinkedCalls LinkUserDataCallees(const ShaderRecompiler::Recomp
         calls.push_back({instruction.programCounter, (instruction.rawWords[0] >> 16u) & 0x7fu, 0u});
         addresses.push_back(*target);
     }
+    std::erase_if(tableCalls, [&](const auto& table) {
+        return std::ranges::any_of(calls, [&](const auto& linked) { return linked.programCounter == table.programCounter; });
+    });
     if (calls.empty() && skipped.empty()) return {};
     std::vector<std::vector<std::uint32_t>> callees;
     for (std::size_t call = 0; call < calls.size(); ++call) {

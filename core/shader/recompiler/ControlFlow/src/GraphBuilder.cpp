@@ -1487,6 +1487,11 @@ LinkedCalls LinkCalls(const RdnaProgram& program, std::span<const UserDataCall> 
     std::span<const TableCall> tableCalls, std::span<const std::vector<TableCallee>> tableCallees) {
     if (userDataCalls.size() != userDataCallees.size()) throw std::logic_error("user-data calls and callees differ in number");
     if (tableCalls.size() != tableCallees.size()) throw std::logic_error("table calls and callees differ in number");
+    for (const auto& table : tableCalls) {
+        if (std::any_of(userDataCalls.begin(), userDataCalls.end(), [&](const UserDataCall& user) { return user.programCounter == table.programCounter; })) {
+            throw std::logic_error("a call site is both a user-data call and a table call");
+        }
+    }
     for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
         BoundedJumpTable table;
         if (program.instructions[index].op == RdnaOpcode::SSetpcB64 && resolveBoundedJumpTable(program, index, table)) {
