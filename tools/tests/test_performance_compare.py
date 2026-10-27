@@ -1,10 +1,13 @@
 import copy
+from functools import lru_cache
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -20,6 +23,23 @@ SUMMARY = {
     "top_phases_ms_per_frame": {"Driver.Packet": 12.0, "Driver.Present": 2.0},
     "trace_dropped": False, "trace": "aps5-trace-abc123-7.json.gz",
 }
+
+
+IDENTITY = {"cpu": 'CPU "X"', "cpu_threads": 16, "memory_mib": 32000,
+            "title_id": "PPSA00000", "title": "Example", "content_version": "01.002.000"}
+
+
+@lru_cache(maxsize=2)
+def excessive_json_value(opening, closing):
+    depth = sys.getrecursionlimit() + 64
+    for _ in range(8):
+        value = opening * depth + "0" + closing * depth
+        try:
+            json.loads(value)
+        except RecursionError:
+            return opening * (depth + 128) + "0" + closing * (depth + 128)
+        depth *= 2
+    raise AssertionError("JSON decoder accepted every bounded nesting probe")
 
 
 class PerformanceCompareTests(unittest.TestCase):
@@ -119,7 +139,9 @@ class PerformanceCompareTests(unittest.TestCase):
         notes = "\n".join(report["notes"])
         self.assertIn("state is unknown", notes)
         self.assertIn("missing configuration: gpu, driver", notes)
-        self.assertIn("do not record the CPU, title or scene", notes)
+        self.assertIn("cannot verify the physical machine or scene", notes)
+        self.assertIn("cpu", notes)
+        self.assertIn("title_id", notes)
 
     def test_invalid_metric_and_metadata_shapes_are_rejected_with_location(self):
         cases = [(("presents",), value) for value in (0, -1, True, 1.5, 10 ** 400)]
@@ -129,6 +151,10 @@ class PerformanceCompareTests(unittest.TestCase):
                   (("window", "first_present"), True), (("env",), []), (("env",), {"APS5_TRACE_FRAMES": 4}),
                   (("trace_dropped",), "false"), (("dirty",), 1), (("trace",), None),
                   (("top_phases_ms_per_frame",), []), (("top_phases_ms_per_frame",), {"phase": -1})]
+        cases += [((field,), value) for field in ("cpu", "title_id", "title", "content_version")
+                  for value in (None, True, 12, [])]
+        cases += [((field,), value) for field in ("cpu_threads", "memory_mib")
+                  for value in (None, True, -1, 1.5, "16")]
         for path, value in cases:
             with self.subTest(path=path, value=value):
                 invalid = copy.deepcopy(self.baseline)
@@ -166,6 +192,58 @@ class PerformanceCompareTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("finite numeric range", result.stderr)
 
+    def test_excessive_json_nesting_reports_the_input_location(self):
+        for opening, closing in (("[", "]"), ('{"nested":', "}")):
+            with self.subTest(opening=opening):
+                record = json.dumps(self.baseline)[:-1] + ', "extra": ' + excessive_json_value(opening, closing) + "}"
+                self.before.write_text("\n\n" + record + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, r"before.jsonl:3:") as error:
+                    performance_compare.load_summary(self.before)
+                self.assertIsInstance(error.exception.__cause__, RecursionError)
+
+    def test_excessive_json_nesting_produces_only_a_cli_error(self):
+        cases = ((self.before, "[", "]", ()), (self.before, '{"nested":', "}", ("--json",)),
+                 (self.after, "[", "]", ("--json",)), (self.after, '{"nested":', "}", ()))
+        for path, opening, closing, args in cases:
+            with self.subTest(path=path.name, opening=opening, args=args):
+                self.write(self.before, self.baseline)
+                self.write(self.after, self.candidate)
+                record = json.dumps(self.baseline)[:-1] + ', "extra": ' + excessive_json_value(opening, closing) + "}"
+                path.write_text("\n\n" + record + "\n", encoding="utf-8")
+                original = (self.before.read_bytes(), self.after.read_bytes())
+                result = self.run_cli(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(f"{path}:3:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual((self.before.read_bytes(), self.after.read_bytes()), original)
+
+    def test_json_report_recursion_produces_only_a_cli_error(self):
+        self.write(self.before, self.baseline)
+        self.write(self.after, self.candidate)
+        with patch.object(performance_compare.json, "dumps", side_effect=RecursionError("report nesting is too deep")), \
+                patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
+                patch.object(sys, "stderr", new_callable=io.StringIO) as errors:
+            with self.assertRaises(SystemExit) as error:
+                performance_compare.main([str(self.before), str(self.after), "--json"])
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("JSON report: report nesting is too deep", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_supported_nested_metadata_is_preserved(self):
+        metadata = {"value": 7}
+        for depth in range(16):
+            metadata = {"nested": [metadata]}
+        self.baseline["extra"] = metadata
+        self.write(self.before, self.baseline)
+        self.write(self.after, self.candidate)
+        with patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
+                patch.object(sys, "stderr", new_callable=io.StringIO) as errors:
+            performance_compare.main([str(self.before), str(self.after), "--json"])
+            self.assertEqual(errors.getvalue(), "")
+            self.assertEqual(json.loads(output.getvalue())["baseline"]["extra"], metadata)
+
     def test_markdown_reports_deltas_and_escapes_table_values(self):
         self.candidate["frame_ms"]["max"] = 60.0
         self.candidate["gpu"] = "GPU | <vendor>\nline"
@@ -200,6 +278,139 @@ class PerformanceCompareTests(unittest.TestCase):
         result = self.run_cli("--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["baseline"], self.baseline)
+
+    def test_matching_recorded_machine_and_title_context_is_accepted(self):
+        self.baseline.update(IDENTITY)
+        self.candidate.update(IDENTITY)
+        self.write(self.before, self.baseline)
+        self.write(self.after, self.candidate)
+        result = self.run_cli("--require-matching-context", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["configuration_differences"], {})
+        self.assertEqual(report["baseline"], self.baseline)
+        self.assertEqual(report["candidate"], self.candidate)
+        self.assertNotIn("missing configuration", "\n".join(report["notes"]))
+        for key in ("cpu_threads", "memory_mib"):
+            with self.subTest(unknown=key):
+                self.baseline[key] = self.candidate[key] = 0
+                performance_compare.validate(self.baseline)
+                report = performance_compare.compare(self.baseline, self.candidate)
+                self.assertEqual(report["configuration_differences"], {})
+                self.assertIn(key, "\n".join(report["notes"]))
+
+    def test_recorded_identity_differences_are_reported_and_rejected_in_strict_mode(self):
+        self.baseline.update(IDENTITY)
+        self.write(self.before, self.baseline)
+        changes = {"cpu": "Other CPU", "cpu_threads": 8, "memory_mib": 16000,
+                   "title_id": "PPSA00001", "title": "Other title", "content_version": "01.003.000"}
+        for key, value in changes.items():
+            with self.subTest(key=key):
+                candidate = {**self.candidate, **IDENTITY, key: value}
+                expected = {key: {"baseline": IDENTITY[key], "candidate": value}}
+                self.assertEqual(performance_compare.compare(self.baseline, candidate)["configuration_differences"], expected)
+                self.write(self.after, candidate)
+                result = self.run_cli("--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["configuration_differences"], expected)
+                self.assertEqual(report["metrics_ms"]["frame_ms.p50"]["change"], 0)
+                result = self.run_cli("--require-matching-context", "--json")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(f"recorded configuration differs: {key}", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_missing_identity_is_distinct_from_known_identity_but_legacy_summaries_still_work(self):
+        for key in IDENTITY:
+            for label in ("baseline", "candidate"):
+                with self.subTest(key=key, missing=label):
+                    baseline = {**self.baseline, **IDENTITY}
+                    candidate = {**self.candidate, **IDENTITY}
+                    (baseline if label == "baseline" else candidate).pop(key)
+                    report = performance_compare.compare(baseline, candidate)
+                    self.assertEqual(report["configuration_differences"],
+                                     {key: {"baseline": baseline.get(key), "candidate": candidate.get(key)}})
+                    self.assertIn(f"{label}: missing configuration: {key}.", report["notes"])
+        self.write(self.before, self.baseline)
+        self.write(self.after, self.candidate)
+        result = self.run_cli("--require-matching-context", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["configuration_differences"], {})
+        self.assertIn("cpu", "\n".join(report["notes"]))
+        self.assertIn("title_id", "\n".join(report["notes"]))
+        self.write(self.after, {**self.candidate, **IDENTITY})
+        result = self.run_cli("--require-matching-context")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        for key in IDENTITY:
+            self.assertIn(key, result.stderr)
+
+    def test_recorded_identity_differences_are_escaped_in_markdown(self):
+        self.baseline.update(IDENTITY)
+        self.candidate.update(IDENTITY, cpu="CPU | <\u03a9>\nline", title="Other title", content_version="02.000.000")
+        self.write(self.before, self.baseline)
+        self.write(self.after, self.candidate)
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CPU &#124; &lt;\u03a9&gt; line", result.stdout)
+        self.assertIn("| title | Example | Other title |", result.stdout)
+        self.assertIn("| content_version | 01.002.000 | 02.000.000 |", result.stdout)
+
+    def test_matching_context_can_be_required_without_a_timing_verdict(self):
+        self.write(self.before, self.baseline)
+        self.candidate["frame_ms"]["max"] = 100.0
+        self.write(self.after, self.candidate)
+        result = self.run_cli("--require-matching-context", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["metrics_ms"]["frame_ms.max"]["change"], 60.0)
+        for field in ("gpu", "driver", "os", "resolution"):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(self.candidate)
+                candidate[field] += " changed"
+                self.write(self.after, candidate)
+                result = self.run_cli("--require-matching-context")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(field, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.run_cli().returncode, 0)
+        for key, value in (("window", dict(self.candidate["window"], first_present=900)),
+                           ("env", {"APS5_TRACE_FRAMES": "900:4"})):
+            with self.subTest(key=key):
+                candidate = copy.deepcopy(self.candidate)
+                candidate[key] = value
+                self.write(self.after, candidate)
+                self.assertEqual(self.run_cli("--require-matching-context").returncode, 2)
+
+
+
+    def test_main_reconfigures_streams(self):
+        class Stream:
+            def __init__(self):
+                self.encoding = None
+                self.errors = None
+
+            def reconfigure(self, encoding=None, errors=None):
+                self.encoding = encoding
+                self.errors = errors
+
+            def write(self, text):
+                pass
+
+            def flush(self):
+                pass
+
+        out, err = Stream(), Stream()
+        with patch.object(performance_compare.sys, "stdout", out), patch.object(performance_compare.sys, "stderr", err):
+            try:
+                performance_compare.main([])
+            except SystemExit:
+                pass
+        self.assertEqual(out.encoding, "utf-8")
+        self.assertEqual(out.errors, "backslashreplace")
+        self.assertEqual(err.encoding, "utf-8")
+        self.assertEqual(err.errors, "backslashreplace")
 
 
 if __name__ == "__main__":

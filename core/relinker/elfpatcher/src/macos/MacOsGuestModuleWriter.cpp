@@ -21,7 +21,7 @@ std::string DynamicName(const Relinker::GuestImage& guest, const std::size_t ind
 
 }
 
-std::vector<std::uint8_t> GuestModuleWriter::WriteMacOs(const Relinker::GuestImage& guest, const std::vector<std::string>& dependencies, const std::string& runPath) const {
+std::vector<std::uint8_t> GuestModuleWriter::WriteMacOs(const Relinker::GuestImage& guest, const std::vector<std::string>& dependencies, const std::string& runPath, const std::function<void(std::string_view)>& message) const {
     using namespace MacOs;
     Windows::WindowsLoadImage image(guest.Bytes, guest.Headers, false);
     MacOsImageInput input;
@@ -30,6 +30,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteMacOs(const Relinker::GuestIma
     input.Source = &guest.Bytes;
     input.Headers = &guest.Headers;
     input.Image = &image;
+    input.Message = message;
 
     const auto tls = std::find_if(guest.Headers.begin(), guest.Headers.end(), [](const auto& header) { return header.Type == 7; });
     std::map<std::uint64_t, std::uint64_t> targets;
@@ -96,11 +97,12 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteMacOs(const Relinker::GuestIma
         if (symbol.Section == 0 || symbol.Section == Relinker::AbsoluteSection || (symbol.Info >> 4) == 0 || symbol.Visibility == 1 || symbol.Visibility == 2) continue;
         if (symbol.Section >= 0xff00) throw Domain::RelinkerException("Unsupported guest export section: " + symbol.Name);
         const auto name = "_" + DynamicName(guest, index);
+        const auto flags = (symbol.Info >> 4) == 2 ? ExportWeakDefinition : std::uint64_t{0};
         if ((symbol.Info & 15) == 6) {
-            input.TlsExports.push_back({name, symbol.Value});
+            input.TlsExports.push_back({name, symbol.Value, flags});
             continue;
         }
-        input.Exports.push_back({name, image.GetRva(symbol.Value, std::max<std::uint64_t>(symbol.Size, 1))});
+        input.Exports.push_back({name, image.GetRva(symbol.Value, std::max<std::uint64_t>(symbol.Size, 1)), flags});
     }
 
     for (const auto& dependency : dependencies) input.Dylibs.push_back(MachODependency(dependency, "@loader_path"));
@@ -109,7 +111,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteMacOs(const Relinker::GuestIma
     input.RunPaths = MachORunPaths(runPath, "@loader_path");
     for (const auto slot : guest.InitArray) input.InitArrayRvas.push_back(image.GetRva(slot, 8));
     for (const auto slot : guest.FiniArray) input.FiniArrayRvas.push_back(image.GetRva(slot, 8));
-    input.InitRva = guest.Init == 0 ? 0 : image.GetRva(guest.Init);
+    input.InitRva = guest.HasInit ? image.GetRva(guest.Init) : 0;
     input.FiniRva = guest.Fini == 0 ? 0 : image.GetRva(guest.Fini);
     input.Trampolines = &guest.Trampolines;
     try {

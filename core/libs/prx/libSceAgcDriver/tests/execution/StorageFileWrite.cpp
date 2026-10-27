@@ -1,3 +1,6 @@
+#include "prx/libkernel/include/Api.hpp"
+#include "prx/libkernel/File/include/File.hpp"
+#include "prx/libc/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -19,6 +22,10 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 #ifdef _WIN32
@@ -31,27 +38,6 @@
 #endif
 
 class FileStream;
-struct GuestIovec { void* base; std::size_t length; };
-
-extern "C" {
-int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
-int APS5_VABI sceKernelClose(int);
-std::int64_t APS5_VABI sceKernelWrite(int, const void*, std::size_t);
-std::int64_t APS5_VABI sceKernelPwrite(int, const void*, std::size_t, std::int64_t);
-std::int64_t APS5_VABI sceKernelWritev(int, const GuestIovec*, int);
-std::int64_t APS5_VABI sceKernelPwritev(int, const GuestIovec*, int, std::int64_t);
-std::int64_t APS5_VABI write_nid_postfix(int, const char*, std::int64_t);
-std::int64_t APS5_VABI _write_nid_postfix(int, const void*, std::size_t);
-std::int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int, const void*, std::size_t, std::int64_t);
-std::int64_t APS5_VABI writev_nid_postfix(int, const GuestIovec*, int);
-std::int64_t APS5_VABI pwritev_nid_postfix(int, const GuestIovec*, int, std::int64_t);
-int APS5_VABI sceKernelAioSubmitWriteCommands(KernelAioRwRequest*, std::int32_t, std::int32_t, std::int32_t*);
-int APS5_VABI sceKernelAioSubmitWriteCommandsMultiple(KernelAioRwRequest*, std::int32_t, std::int32_t, std::int32_t*);
-int APS5_VABI sceKernelAioDeleteRequest(std::int32_t, std::int32_t*);
-FileStream* APS5_VABI fopen_nid_postfix(const char*, const char*);
-std::size_t APS5_VABI fwrite_nid_postfix(const void*, std::size_t, std::size_t, FileStream*);
-int APS5_VABI fclose_nid_postfix(FileStream*);
-}
 
 namespace {
 
@@ -188,7 +174,7 @@ bool CheckWrite(Api api, const char* name, GuestSurface& surface, GuestSurface& 
     const auto hold = ProduceHeld(surface, unrelated);
     OutputFile file;
     auto* source = surface.Data() + SourceOffset;
-    const std::array<GuestIovec, 4> vectors{{{source, 111}, {nullptr, 0}, {source + 111, 65537}, {source + 65648, TransferBytes - 65648}}};
+    const std::array<KernelIovec, 4> vectors{{{source, 111}, {nullptr, 0}, {source + 111, 65537}, {source + 65648, TransferBytes - 65648}}};
     const bool positioned = api == Api::Pwrite || api == Api::PosixPwrite || api == Api::Pwritev || api == Api::PosixPwritev || api == Api::Aio || api == Api::AioMultiple;
     if (api == Api::Fwrite) {
         auto* stream = fopen_nid_postfix(file.Name().c_str(), "wb");
@@ -233,7 +219,7 @@ bool CheckWrite(Api api, const char* name, GuestSurface& surface, GuestSurface& 
             KernelAioResult result{};
             KernelAioRwRequest request{FileOffset, TransferBytes, source, &result, output};
             std::int32_t id = 0;
-            Require((api == Api::Aio ? sceKernelAioSubmitWriteCommands(&request, 1, 0, &id) : sceKernelAioSubmitWriteCommandsMultiple(&request, 1, 0, &id)) == 0, "file write: AIO submission failed");
+            Require((api == Api::Aio ? sceKernelAioSubmitWriteCommands(&request, 1, 1, &id) : sceKernelAioSubmitWriteCommandsMultiple(&request, 1, 1, &id)) == 0, "file write: AIO submission failed");
             std::int32_t removed = -1;
             Require(sceKernelAioDeleteRequest(id, &removed) == 0 && removed == 0, "file write: AIO deletion failed");
             Require(result.state == 3, "file write: AIO did not complete");
@@ -256,12 +242,74 @@ bool CheckWrite(Api api, const char* name, GuestSurface& surface, GuestSurface& 
     return differences == 0;
 }
 
+void CheckConcurrentFlushWait(GuestSurface& surface) {
+    Produce(surface.Data());
+    const auto address = reinterpret_cast<std::uintptr_t>(surface.Data());
+    Require(AgcDriver::Graphics::StorageTexture::FindPending(address, SurfaceBytes) != nullptr, "file write: concurrent flush setup has no pending image");
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool gpuLocked = false;
+    bool releaseGpu = false;
+    std::thread holder([&] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        {
+            std::lock_guard lock(mutex);
+            gpuLocked = true;
+        }
+        changed.notify_all();
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return releaseGpu; });
+    });
+    {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return gpuLocked; });
+    }
+    std::exception_ptr flushFailure;
+    std::thread flusher([&] {
+        try { AgcDriver::Graphics::StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "concurrent flush test"); }
+        catch (...) { flushFailure = std::current_exception(); }
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (AgcDriver::Graphics::StorageTexture::FindPending(address, SurfaceBytes) != nullptr && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool taken = AgcDriver::Graphics::StorageTexture::FindPending(address, SurfaceBytes) == nullptr;
+    std::vector<std::byte> seen(SurfaceBytes);
+    std::atomic<bool> readDone = false;
+    std::exception_ptr readFailure;
+    std::thread reader;
+    if (taken) {
+        reader = std::thread([&] {
+            try {
+                AgcDriver::Graphics::StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "concurrent read test");
+                AgcDriver::GuestMemory::Read(address, seen);
+            } catch (...) {
+                readFailure = std::current_exception();
+            }
+            readDone.store(true, std::memory_order_release);
+            changed.notify_all();
+        });
+        std::unique_lock lock(mutex);
+        changed.wait_for(lock, std::chrono::milliseconds(50), [&] { return readDone.load(std::memory_order_acquire); });
+        releaseGpu = true;
+    } else {
+        std::lock_guard lock(mutex);
+        releaseGpu = true;
+    }
+    changed.notify_all();
+    holder.join();
+    flusher.join();
+    if (reader.joinable()) reader.join();
+    Require(taken, "file write: concurrent flush did not take the pending image");
+    if (flushFailure != nullptr) std::rethrow_exception(flushFailure);
+    if (readFailure != nullptr) std::rethrow_exception(readFailure);
+    Require(std::any_of(seen.begin(), seen.end(), [](std::byte value) { return value != std::byte{}; }), "file write: concurrent guest read returned before an overlapping image was stored");
+}
+
 void CheckShutdownAndGuard() {
     OutputFile file;
     std::vector<std::byte> source(TransferBytes, std::byte{0x5a});
     AgcDriver::GuestMemory::SetFlushHook(nullptr);
-    AgcDriver::GuestMemory::SetReadGuard([](std::uint64_t, std::size_t) { throw std::runtime_error("file source read guard"); });
     const auto descriptor = file.Open();
+    AgcDriver::GuestMemory::SetReadGuard([](std::uint64_t, std::size_t) { throw std::runtime_error("file source read guard"); });
     bool refused = false;
     try { sceKernelWrite(descriptor, source.data(), source.size()); }
     catch (const std::runtime_error& error) { refused = std::string(error.what()) == "file source read guard"; }
@@ -282,6 +330,7 @@ int main() {
         }
         GuestSurface surface;
         GuestSurface unrelated;
+        CheckConcurrentFlushWait(surface);
         Produce(unrelated.Data());
         bool correct = true;
         const std::array<std::pair<Api, const char*>, 12> cases{{

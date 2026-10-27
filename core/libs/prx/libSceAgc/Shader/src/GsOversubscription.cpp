@@ -1,3 +1,4 @@
+#include "prx/libSceAgc/Shader/include/GsOversubscription.hpp"
 #include <cstdio>
 #include <cstdlib>
 #ifdef _WIN32
