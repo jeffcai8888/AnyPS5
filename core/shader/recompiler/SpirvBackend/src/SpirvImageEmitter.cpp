@@ -551,9 +551,6 @@ SpirvBufferFormatInfo ImageConversionFormat(const ImageResource& image) {
 }
 
 void RequireConvertedUnormAccess(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SpirvBufferFormatInfo& info) {
-    if (access.mem.dataBits == 16u && info.byteSize != 2u) {
-        ctx.Fail(access.inst, info.type == SpirvFormatComponentType::Float ? "reads or writes a converted float image with 16-bit data, which is not implemented" : "reads or writes a converted unorm image with 16-bit data, which is not implemented");
-    }
     for (std::uint32_t component = 0; component < 4u; component++) {
         const auto selector = (access.image.shaderSwizzle >> (component * 3u)) & 7u;
         if (selector >= 4u && selector - 4u >= info.componentCount && info.byteSize != 2u) {
@@ -609,6 +606,9 @@ std::uint32_t UnpackImageTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess
     }
     const bool unorm = info.type == SpirvFormatComponentType::Unorm || info.type == SpirvFormatComponentType::Float;
     if (unorm) {
+        if (access.mem.dataBits == 16u && info.byteSize != 2u) {
+            ctx.Fail(access.inst, info.type == SpirvFormatComponentType::Float ? "reads a converted float image with 16-bit data, which is not implemented" : "reads a converted unorm image with 16-bit data, which is not implemented");
+        }
         RequireConvertedUnormAccess(ctx, access, info);
     }
     const auto packed = state.module.AllocateId();
@@ -816,6 +816,8 @@ std::uint32_t StoreTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& acce
     const auto storageFormat = GetFormatInfo(access.image.conversionFormat);
     const auto float16 = access.image.resourceClass == ImageResourceClass::Storage && access.image.numericClass == IrTextureNumericClass::Uint &&
         (access.image.conversionFormat == IrBufferFormat::Format16Float || access.image.conversionFormat == IrBufferFormat::Format16_16Float || access.image.conversionFormat == IrBufferFormat::Format16_16_16_16Float);
+    const auto packedUnormStore = !integer && mem.dataBits == 16u && storageFormat.packedBitfield &&
+        (storageFormat.type == SpirvFormatComponentType::Unorm || storageFormat.type == SpirvFormatComponentType::Float);
     std::uint32_t values[4] = {};
     const auto dmask = EffectiveDmask(mem);
     for (std::uint32_t component = 0; component < 4u; component++) {
@@ -836,7 +838,7 @@ std::uint32_t StoreTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& acce
             }
             raw = Select(state, TypeU32(state), Binary(state, spv::OpIEqual, TypeBool(state), RuntimeImageSwizzle(state, mem.resource, source), ConstantU32(state, component + 4u)), candidate, raw);
         }
-        values[component] = integer ? raw : mem.dataBits == 16u ? EmitF16BitsToF32(state, raw) : Unary(state, spv::OpBitcast, TypeF32(state), raw);
+        values[component] = integer ? raw : mem.dataBits == 16u ? (packedUnormStore ? raw : EmitF16BitsToF32(state, raw)) : Unary(state, spv::OpBitcast, TypeF32(state), raw);
         if (float16 && component < storageFormat.componentCount) {
             values[component] = EmitFormatStoreComponent(state, storageFormat, component, values[component]);
         }
@@ -846,7 +848,7 @@ std::uint32_t StoreTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& acce
     }
     const auto texel = state.module.AllocateId();
     const bool rawUintStorage = sint.format != IrBufferFormat::Invalid || float16;
-    state.module.AddFunction(spv::OpCompositeConstruct, integer || rawUintStorage ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), texel, values[0], values[1], values[2], values[3]);
+    state.module.AddFunction(spv::OpCompositeConstruct, integer || rawUintStorage || packedUnormStore ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), texel, values[0], values[1], values[2], values[3]);
     return rawUintStorage ? texel : PackImageTexel(ctx, access, texel);
 }
 
